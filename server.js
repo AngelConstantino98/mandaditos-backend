@@ -22,7 +22,7 @@ io.on("connection", (socket) => {
   socket.on("nuevo-pedido", (data) => {
     console.log("📦 Pedido recibido:", data);
 
-    // reenviar a todos los clientes (repartidores y admin)
+    // reenviar a todos
     io.emit("pedido-actualizado", data);
   });
 
@@ -30,7 +30,7 @@ io.on("connection", (socket) => {
   socket.on("repartidor-ubicacion", (data) => {
     console.log("🛵 Ubicación repartidor:", data);
 
-    // reenviar a todos los clientes
+    // reenviar a todos
     io.emit("repartidor-movimiento", data);
   });
 
@@ -39,6 +39,9 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(3001, () => {
-  console.log("🚀 Servidor Socket.io corriendo en puerto 3001");
+// 🚀 PUERTO PARA RENDER / PRODUCCIÓN
+const PORT = process.env.PORT || 3001;
+
+server.listen(PORT, () => {
+  console.log("🚀 Servidor Socket.io corriendo en puerto " + PORT);
 });

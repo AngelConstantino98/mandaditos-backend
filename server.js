@@ -14,32 +14,47 @@ const io = new Server(server, {
   },
 });
 
-// 📡 cuando alguien se conecta
+// 🧠 memoria de pedidos
+let pedidos = [];
+
 io.on("connection", (socket) => {
   console.log("🟢 Usuario conectado:", socket.id);
 
   // 📦 NUEVO PEDIDO
   socket.on("nuevo-pedido", (data) => {
-    console.log("📦 Pedido recibido:", data);
+    const pedido = {
+      ...data,
+      id: Date.now(),
+      estado: "pendiente"
+    };
 
-    // reenviar a todos
-    io.emit("pedido-actualizado", data);
+    pedidos.push(pedido);
+
+    io.emit("pedido-nuevo", pedido);
   });
 
-  // 🛵 UBICACIÓN DEL REPARTIDOR EN VIVO
-  socket.on("repartidor-ubicacion", (data) => {
-    console.log("🛵 Ubicación repartidor:", data);
+  // 🔄 CAMBIAR ESTADO DEL PEDIDO
+  socket.on("cambiar-estado", (pedidoActualizado) => {
+    pedidos = pedidos.map((p) =>
+      p.id === pedidoActualizado.id ? pedidoActualizado : p
+    );
 
-    // reenviar a todos
+    io.emit("pedido-actualizado", pedidoActualizado);
+  });
+
+  // 🛵 GPS REPARTIDOR
+  socket.on("repartidor-ubicacion", (data) => {
     io.emit("repartidor-movimiento", data);
   });
+
+  // 📦 ENVIAR PEDIDOS EXISTENTES AL CONECTARSE
+  socket.emit("pedidos-iniciales", pedidos);
 
   socket.on("disconnect", () => {
     console.log("🔴 Usuario desconectado:", socket.id);
   });
 });
 
-// 🚀 PUERTO PARA RENDER / PRODUCCIÓN
 const PORT = process.env.PORT || 3001;
 
 server.listen(PORT, () => {

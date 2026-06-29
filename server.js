@@ -20,24 +20,24 @@ let pedidos = [];
 io.on("connection", (socket) => {
   console.log("🟢 Usuario conectado:", socket.id);
 
+  // 📦 enviar historial al conectar
+  socket.emit("pedidos-iniciales", pedidos);
+
   // 📦 NUEVO PEDIDO
-socket.on("nuevo-pedido", (data) => {
-  const pedido = {
-    ...data,
-    id: Date.now(),
-    estado: "Pendiente"
-  };
+  socket.on("nuevo-pedido", (data) => {
+    const pedido = {
+      ...data,
+      id: Date.now(),
+      estado: "pendiente"
+    };
 
-  pedidos.push(pedido);
+    pedidos.push(pedido);
 
-  // Se envía al repartidor
-  io.emit("pedido-nuevo", pedido);
+    // 🔥 enviar a TODOS (cliente + repartidor)
+    io.emit("pedido-actualizado", pedido);
+  });
 
-  // También se envía al cliente para que vea su pedido inmediatamente
-  socket.emit("pedido-actualizado", pedido);
-});
-
-  // 🔄 CAMBIAR ESTADO DEL PEDIDO
+  // 🔄 CAMBIAR ESTADO (aceptado / en camino / entregado)
   socket.on("cambiar-estado", (pedidoActualizado) => {
     pedidos = pedidos.map((p) =>
       p.id === pedidoActualizado.id ? pedidoActualizado : p
@@ -46,13 +46,21 @@ socket.on("nuevo-pedido", (data) => {
     io.emit("pedido-actualizado", pedidoActualizado);
   });
 
+  // ❌ CANCELAR PEDIDO (NUEVO IMPORTANTE)
+  socket.on("cancelar-pedido", (data) => {
+    pedidos = pedidos.map((p) =>
+      p.id === data.id ? { ...p, estado: "cancelado" } : p
+    );
+
+    const actualizado = pedidos.find((p) => p.id === data.id);
+
+    io.emit("pedido-actualizado", actualizado);
+  });
+
   // 🛵 GPS REPARTIDOR
   socket.on("repartidor-ubicacion", (data) => {
     io.emit("repartidor-movimiento", data);
   });
-
-  // 📦 ENVIAR PEDIDOS EXISTENTES AL CONECTARSE
-  socket.emit("pedidos-iniciales", pedidos);
 
   socket.on("disconnect", () => {
     console.log("🔴 Usuario desconectado:", socket.id);

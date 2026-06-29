@@ -21,17 +21,21 @@ io.on("connection", (socket) => {
   console.log("🟢 Usuario conectado:", socket.id);
 
   // 📦 NUEVO PEDIDO
-  socket.on("nuevo-pedido", (data) => {
-    const pedido = {
-      ...data,
-      id: Date.now(),
-      estado: "pendiente"
-    };
+socket.on("nuevo-pedido", (data) => {
+  const pedido = {
+    ...data,
+    id: Date.now(),
+    estado: "Pendiente"
+  };
 
-    pedidos.push(pedido);
+  pedidos.push(pedido);
 
-    io.emit("pedido-nuevo", pedido);
-  });
+  // Se envía al repartidor
+  io.emit("pedido-nuevo", pedido);
+
+  // También se envía al cliente para que vea su pedido inmediatamente
+  socket.emit("pedido-actualizado", pedido);
+});
 
   // 🔄 CAMBIAR ESTADO DEL PEDIDO
   socket.on("cambiar-estado", (pedidoActualizado) => {

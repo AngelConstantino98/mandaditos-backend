@@ -22,17 +22,23 @@ io.on("connection", (socket) => {
 
   const clienteId = socket.handshake.query.clienteId;
 
-  // 🔐 meter cada cliente en su propia sala
+  // 👤 CLIENTES → room privado
   if (clienteId) {
     socket.join(clienteId);
-    console.log("📦 Cliente en room:", clienteId);
+    console.log("👤 Cliente en room:", clienteId);
+
+    // 📦 SOLO historial del cliente
+    socket.emit(
+      "pedidos-iniciales",
+      pedidos.filter((p) => p.clienteId === clienteId)
+    );
   }
 
-  // 📦 SOLO enviar historial del cliente
-  socket.emit(
-    "pedidos-iniciales",
-    pedidos.filter((p) => p.clienteId === clienteId)
-  );
+  // 🛵 REPARTIDOR → room global
+  socket.on("repartidor-conectar", () => {
+    socket.join("repartidores");
+    console.log("🛵 Repartidor conectado");
+  });
 
   // 📦 NUEVO PEDIDO
   socket.on("nuevo-pedido", (data) => {
@@ -44,23 +50,35 @@ io.on("connection", (socket) => {
 
     pedidos.push(pedido);
 
-    // 🔥 SOLO a su room
+    // 👤 SOLO cliente dueño
     io.to(pedido.clienteId).emit("pedido-actualizado", pedido);
+
+    // 🛵 TODOS los repartidores
+    io.to("repartidores").emit("nuevo-pedido-repartidor", pedido);
+
+    console.log("📦 Pedido creado:", pedido.id);
   });
 
-  // 🔄 CAMBIAR ESTADO
+  // 🔄 CAMBIAR ESTADO (repartidor o sistema)
   socket.on("cambiar-estado", (pedidoActualizado) => {
     pedidos = pedidos.map((p) =>
       p.id === pedidoActualizado.id ? pedidoActualizado : p
     );
 
+    // 👤 cliente dueño
     io.to(pedidoActualizado.clienteId).emit(
+      "pedido-actualizado",
+      pedidoActualizado
+    );
+
+    // 🛵 repartidores también actualizan
+    io.to("repartidores").emit(
       "pedido-actualizado",
       pedidoActualizado
     );
   });
 
-  // ❌ CANCELAR
+  // ❌ CANCELAR PEDIDO
   socket.on("cancelar-pedido", (data) => {
     pedidos = pedidos.map((p) =>
       p.id === data.id ? { ...p, estado: "cancelado" } : p
@@ -73,10 +91,15 @@ io.on("connection", (socket) => {
         "pedido-actualizado",
         actualizado
       );
+
+      io.to("repartidores").emit(
+        "pedido-actualizado",
+        actualizado
+      );
     }
   });
 
-  // 🛵 GPS repartidor (esto sí es global)
+  // 🛵 GPS repartidor (global)
   socket.on("repartidor-ubicacion", (data) => {
     io.emit("repartidor-movimiento", data);
   });

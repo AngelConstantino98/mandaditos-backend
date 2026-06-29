@@ -27,17 +27,19 @@ io.on("connection", (socket) => {
     socket.join(clienteId);
     console.log("👤 Cliente en room:", clienteId);
 
-    // 📦 SOLO historial del cliente
     socket.emit(
       "pedidos-iniciales",
       pedidos.filter((p) => p.clienteId === clienteId)
     );
   }
 
-  // 🛵 REPARTIDOR → room global
+  // 🛵 REPARTIDOR → room global + historial
   socket.on("repartidor-conectar", () => {
     socket.join("repartidores");
     console.log("🛵 Repartidor conectado");
+
+    // 🔥 HISTORIAL COMPLETO PARA REPARTIDOR
+    socket.emit("pedidos-iniciales", pedidos);
   });
 
   // 📦 NUEVO PEDIDO
@@ -59,26 +61,24 @@ io.on("connection", (socket) => {
     console.log("📦 Pedido creado:", pedido.id);
   });
 
-  // 🔄 CAMBIAR ESTADO (repartidor o sistema)
+  // 🔄 CAMBIAR ESTADO
   socket.on("cambiar-estado", (pedidoActualizado) => {
     pedidos = pedidos.map((p) =>
       p.id === pedidoActualizado.id ? pedidoActualizado : p
     );
 
-    // 👤 cliente dueño
     io.to(pedidoActualizado.clienteId).emit(
       "pedido-actualizado",
       pedidoActualizado
     );
 
-    // 🛵 repartidores también actualizan
     io.to("repartidores").emit(
       "pedido-actualizado",
       pedidoActualizado
     );
   });
 
-  // ❌ CANCELAR PEDIDO
+  // ❌ CANCELAR
   socket.on("cancelar-pedido", (data) => {
     pedidos = pedidos.map((p) =>
       p.id === data.id ? { ...p, estado: "cancelado" } : p
@@ -99,7 +99,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 🛵 GPS repartidor (global)
+  // 🛵 GPS repartidor
   socket.on("repartidor-ubicacion", (data) => {
     io.emit("repartidor-movimiento", data);
   });

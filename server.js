@@ -2,6 +2,8 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -16,6 +18,146 @@ const io = new Server(server, {
 
 // 🧠 Memoria de pedidos
 let pedidos = [];
+
+// ⭐ Archivo simple para guardar recompensas
+const RECOMPENSAS_FILE = path.join(__dirname, "recompensas.json");
+
+function cargarRecompensas() {
+  try {
+    if (fs.existsSync(RECOMPENSAS_FILE)) {
+      return JSON.parse(fs.readFileSync(RECOMPENSAS_FILE, "utf8"));
+    }
+  } catch (error) {
+    console.log("⚠️ No se pudieron cargar recompensas:", error.message);
+  }
+
+  return {};
+}
+
+function guardarRecompensas() {
+  try {
+    fs.writeFileSync(
+      RECOMPENSAS_FILE,
+      JSON.stringify(recompensas, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.log("⚠️ No se pudieron guardar recompensas:", error.message);
+  }
+}
+
+let recompensas = cargarRecompensas();
+
+function crearRecompensaVacia() {
+  return {
+    pedidosCompletados: 0,
+    meta: 10,
+    recompensaDisponible: false,
+    pedidosContados: [],
+    fechaActualizacion: null,
+  };
+}
+
+function obtenerRecompensaCliente(clienteId) {
+  if (!clienteId) return null;
+
+  if (!recompensas[clienteId]) {
+    recompensas[clienteId] = crearRecompensaVacia();
+    guardarRecompensas();
+  }
+
+  return recompensas[clienteId];
+}
+
+function obtenerRecompensaPublica(clienteId) {
+  const recompensa = obtenerRecompensaCliente(clienteId);
+
+  if (!recompensa) return null;
+
+  return {
+    clienteId,
+    pedidosCompletados: recompensa.pedidosCompletados,
+    meta: recompensa.meta,
+    recompensaDisponible: recompensa.recompensaDisponible,
+    faltan: Math.max(recompensa.meta - recompensa.pedidosCompletados, 0),
+  };
+}
+
+function emitirRecompensaCliente(clienteId) {
+  if (!clienteId) return;
+
+  io.to(clienteId).emit(
+    "recompensa-actualizada",
+    obtenerRecompensaPublica(clienteId)
+  );
+}
+
+function registrarPedidoEntregado(pedido) {
+  if (!pedido?.clienteId || pedido.estado !== "entregado") return;
+
+  const recompensa = obtenerRecompensaCliente(pedido.clienteId);
+  const pedidoId = String(pedido.id);
+
+  // Evita sumar el mismo pedido dos veces
+  if (recompensa.pedidosContados.includes(pedidoId)) {
+    emitirRecompensaCliente(pedido.clienteId);
+    return;
+  }
+
+  // Si ya tiene recompensa disponible, dejamos el progreso en 10/10
+  // hasta que el cliente use su envío gratis.
+  if (recompensa.recompensaDisponible) {
+    emitirRecompensaCliente(pedido.clienteId);
+    return;
+  }
+
+  recompensa.pedidosContados.push(pedidoId);
+
+  recompensa.pedidosCompletados = Math.min(
+    recompensa.pedidosCompletados + 1,
+    recompensa.meta
+  );
+
+  if (recompensa.pedidosCompletados >= recompensa.meta) {
+    recompensa.recompensaDisponible = true;
+  }
+
+  recompensa.fechaActualizacion = new Date().toISOString();
+  guardarRecompensas();
+
+  emitirRecompensaCliente(pedido.clienteId);
+
+  console.log("⭐ Recompensa actualizada:", {
+    clienteId: pedido.clienteId,
+    pedidosCompletados: recompensa.pedidosCompletados,
+    recompensaDisponible: recompensa.recompensaDisponible,
+  });
+}
+
+function usarRecompensaCliente(clienteId) {
+  const recompensa = obtenerRecompensaCliente(clienteId);
+
+  if (!recompensa?.recompensaDisponible) {
+    return {
+      ok: false,
+      mensaje: "No tienes una recompensa disponible.",
+    };
+  }
+
+  recompensa.pedidosCompletados = 0;
+  recompensa.recompensaDisponible = false;
+  recompensa.fechaActualizacion = new Date().toISOString();
+
+  // Importante: NO borramos pedidosContados para evitar que pedidos viejos
+  // vuelvan a sumar si se actualizan otra vez.
+  guardarRecompensas();
+  emitirRecompensaCliente(clienteId);
+
+  return {
+    ok: true,
+    mensaje: "Recompensa usada correctamente.",
+  };
+}
 
 // 🍀 Configuración de promociones
 const promociones = {
@@ -88,7 +230,21 @@ io.on("connection", (socket) => {
       "pedidos-iniciales",
       pedidos.filter((p) => p.clienteId === clienteId)
     );
+
+    // ⭐ Enviar estado de recompensas al cliente
+    emitirRecompensaCliente(clienteId);
   }
+
+  // ⭐ Cliente pide consultar sus recompensas
+  socket.on("obtener-recompensa", (callback) => {
+    const respuesta = obtenerRecompensaPublica(clienteId);
+
+    socket.emit("recompensa-actualizada", respuesta);
+
+    if (typeof callback === "function") {
+      callback(respuesta);
+    }
+  });
 
   // 🛵 REPARTIDOR → room global + historial
   socket.on("repartidor-conectar", () => {
@@ -101,11 +257,31 @@ io.on("connection", (socket) => {
 
   // 📦 NUEVO PEDIDO
   socket.on("nuevo-pedido", (data) => {
+    let recompensaPedido = {
+      usada: false,
+      tipo: null,
+    };
+
+    // ⭐ En pasos siguientes el cliente podrá mandar data.recompensa.usar = true
+    // para aplicar su envío gratis.
+    if (data.recompensa?.usar === true) {
+      const resultadoRecompensa = usarRecompensaCliente(data.clienteId);
+
+      if (resultadoRecompensa.ok) {
+        recompensaPedido = {
+          usada: true,
+          tipo: "envio-gratis-10-pedidos",
+          mensaje: "ENVÍO GRATIS POR RECOMPENSA",
+        };
+      }
+    }
+
     const pedido = {
       ...data,
       id: data.id || Date.now(),
       estado: "pendiente",
       promocion: crearPromocionVacia(),
+      recompensa: recompensaPedido,
     };
 
     pedidos.push(pedido);
@@ -121,19 +297,29 @@ io.on("connection", (socket) => {
 
   // 🔄 CAMBIAR ESTADO
   socket.on("cambiar-estado", (pedidoActualizado) => {
+    const pedidoAnterior = pedidos.find((p) => p.id === pedidoActualizado.id);
+
+    const actualizado = {
+      ...(pedidoAnterior || {}),
+      ...pedidoActualizado,
+    };
+
     pedidos = pedidos.map((p) =>
-      p.id === pedidoActualizado.id ? pedidoActualizado : p
+      p.id === actualizado.id ? actualizado : p
     );
 
-    io.to(pedidoActualizado.clienteId).emit(
+    io.to(actualizado.clienteId).emit(
       "pedido-actualizado",
-      pedidoActualizado
+      actualizado
     );
 
     io.to("repartidores").emit(
       "pedido-actualizado",
-      pedidoActualizado
+      actualizado
     );
+
+    // ⭐ Sumar recompensa cuando el pedido se marca como entregado
+    registrarPedidoEntregado(actualizado);
   });
 
   // ❌ CANCELAR

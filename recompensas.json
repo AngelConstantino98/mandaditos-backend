@@ -1,0 +1,14 @@
+{
+  "90b432e7-6ecf-41e5-9705-7689657011fc": {
+    "pedidosCompletados": 4,
+    "meta": 10,
+    "recompensaDisponible": false,
+    "pedidosContados": [
+      "1783019973569",
+      "1783020744556",
+      "1783021153019",
+      "1783030943367"
+    ],
+    "fechaActualizacion": "2026-07-02T22:23:59.359Z"
+  }
+}

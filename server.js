@@ -5,8 +5,17 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
+let Pool = null;
+
+try {
+  Pool = require("pg").Pool;
+} catch (error) {
+  console.log("⚠️ Paquete pg no instalado. La app usará recompensas.json temporalmente.");
+}
+
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const server = http.createServer(app);
 
@@ -19,7 +28,7 @@ const io = new Server(server, {
 // 🧠 Memoria de pedidos
 let pedidos = [];
 
-// ⭐ Archivo simple para guardar recompensas
+// ⭐ Archivo simple de respaldo para recompensas
 const RECOMPENSAS_FILE = path.join(__dirname, "recompensas.json");
 
 function cargarRecompensas() {
@@ -48,6 +57,25 @@ function guardarRecompensas() {
 
 let recompensas = cargarRecompensas();
 
+const DATABASE_URL = process.env.DATABASE_URL;
+let pool = null;
+let baseDatosLista = false;
+
+if (DATABASE_URL && Pool) {
+  const poolConfig = {
+    connectionString: DATABASE_URL,
+  };
+
+  // Si alguna URL externa trae sslmode=require, activamos SSL.
+  if (DATABASE_URL.includes("sslmode=require")) {
+    poolConfig.ssl = {
+      rejectUnauthorized: false,
+    };
+  }
+
+  pool = new Pool(poolConfig);
+}
+
 function crearRecompensaVacia() {
   return {
     pedidosCompletados: 0,
@@ -58,7 +86,51 @@ function crearRecompensaVacia() {
   };
 }
 
-function obtenerRecompensaCliente(clienteId) {
+function normalizarRecompensaDesdeDB(row, pedidosContados = []) {
+  return {
+    pedidosCompletados: Number(row.pedidos_completados || 0),
+    meta: Number(row.meta || 10),
+    recompensaDisponible: Boolean(row.recompensa_disponible),
+    pedidosContados,
+    fechaActualizacion: row.fecha_actualizacion,
+  };
+}
+
+async function inicializarBaseDatos() {
+  if (!pool) {
+    console.log("⚠️ DATABASE_URL no disponible o pg no instalado. Usando recompensas.json.");
+    return;
+  }
+
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS recompensas (
+        cliente_id TEXT PRIMARY KEY,
+        pedidos_completados INTEGER NOT NULL DEFAULT 0,
+        meta INTEGER NOT NULL DEFAULT 10,
+        recompensa_disponible BOOLEAN NOT NULL DEFAULT FALSE,
+        fecha_actualizacion TIMESTAMPTZ
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS recompensa_pedidos_contados (
+        cliente_id TEXT NOT NULL REFERENCES recompensas(cliente_id) ON DELETE CASCADE,
+        pedido_id TEXT NOT NULL,
+        fecha_contado TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (cliente_id, pedido_id)
+      );
+    `);
+
+    baseDatosLista = true;
+    console.log("✅ Base de datos PostgreSQL lista para recompensas.");
+  } catch (error) {
+    baseDatosLista = false;
+    console.log("⚠️ No se pudo inicializar PostgreSQL. Usando recompensas.json:", error.message);
+  }
+}
+
+function obtenerRecompensaClienteLocal(clienteId) {
   if (!clienteId) return null;
 
   if (!recompensas[clienteId]) {
@@ -69,8 +141,58 @@ function obtenerRecompensaCliente(clienteId) {
   return recompensas[clienteId];
 }
 
-function obtenerRecompensaPublica(clienteId) {
-  const recompensa = obtenerRecompensaCliente(clienteId);
+async function obtenerRecompensaCliente(clienteId) {
+  if (!clienteId) return null;
+
+  if (!baseDatosLista) {
+    return obtenerRecompensaClienteLocal(clienteId);
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO recompensas (cliente_id)
+      VALUES ($1)
+      ON CONFLICT (cliente_id) DO NOTHING;
+      `,
+      [clienteId]
+    );
+
+    const recompensaResult = await pool.query(
+      `
+      SELECT cliente_id, pedidos_completados, meta, recompensa_disponible, fecha_actualizacion
+      FROM recompensas
+      WHERE cliente_id = $1;
+      `,
+      [clienteId]
+    );
+
+    const pedidosResult = await pool.query(
+      `
+      SELECT pedido_id
+      FROM recompensa_pedidos_contados
+      WHERE cliente_id = $1
+      ORDER BY fecha_contado ASC;
+      `,
+      [clienteId]
+    );
+
+    const pedidosContados = pedidosResult.rows.map((row) =>
+      String(row.pedido_id)
+    );
+
+    return normalizarRecompensaDesdeDB(
+      recompensaResult.rows[0],
+      pedidosContados
+    );
+  } catch (error) {
+    console.log("⚠️ Error consultando recompensa en DB:", error.message);
+    return obtenerRecompensaClienteLocal(clienteId);
+  }
+}
+
+async function obtenerRecompensaPublica(clienteId) {
+  const recompensa = await obtenerRecompensaCliente(clienteId);
 
   if (!recompensa) return null;
 
@@ -83,31 +205,31 @@ function obtenerRecompensaPublica(clienteId) {
   };
 }
 
-function emitirRecompensaCliente(clienteId) {
+async function emitirRecompensaCliente(clienteId) {
   if (!clienteId) return;
 
   io.to(clienteId).emit(
     "recompensa-actualizada",
-    obtenerRecompensaPublica(clienteId)
+    await obtenerRecompensaPublica(clienteId)
   );
 }
 
-function registrarPedidoEntregado(pedido) {
+async function registrarPedidoEntregadoLocal(pedido) {
   if (!pedido?.clienteId || pedido.estado !== "entregado") return;
 
-  const recompensa = obtenerRecompensaCliente(pedido.clienteId);
+  const recompensa = obtenerRecompensaClienteLocal(pedido.clienteId);
   const pedidoId = String(pedido.id);
 
   // Evita sumar el mismo pedido dos veces
   if (recompensa.pedidosContados.includes(pedidoId)) {
-    emitirRecompensaCliente(pedido.clienteId);
+    await emitirRecompensaCliente(pedido.clienteId);
     return;
   }
 
   // Si ya tiene recompensa disponible, dejamos el progreso en 10/10
   // hasta que el cliente use su envío gratis.
   if (recompensa.recompensaDisponible) {
-    emitirRecompensaCliente(pedido.clienteId);
+    await emitirRecompensaCliente(pedido.clienteId);
     return;
   }
 
@@ -125,17 +247,109 @@ function registrarPedidoEntregado(pedido) {
   recompensa.fechaActualizacion = new Date().toISOString();
   guardarRecompensas();
 
-  emitirRecompensaCliente(pedido.clienteId);
+  await emitirRecompensaCliente(pedido.clienteId);
 
   console.log("⭐ Recompensa actualizada:", {
     clienteId: pedido.clienteId,
     pedidosCompletados: recompensa.pedidosCompletados,
     recompensaDisponible: recompensa.recompensaDisponible,
+    guardadoEn: "recompensas.json",
   });
 }
 
-function usarRecompensaCliente(clienteId) {
-  const recompensa = obtenerRecompensaCliente(clienteId);
+async function registrarPedidoEntregado(pedido) {
+  if (!pedido?.clienteId || pedido.estado !== "entregado") return;
+
+  if (!baseDatosLista) {
+    await registrarPedidoEntregadoLocal(pedido);
+    return;
+  }
+
+  const cliente = await pool.connect();
+  const clienteId = pedido.clienteId;
+  const pedidoId = String(pedido.id);
+
+  try {
+    await cliente.query("BEGIN");
+
+    await cliente.query(
+      `
+      INSERT INTO recompensas (cliente_id)
+      VALUES ($1)
+      ON CONFLICT (cliente_id) DO NOTHING;
+      `,
+      [clienteId]
+    );
+
+    const recompensaResult = await cliente.query(
+      `
+      SELECT pedidos_completados, meta, recompensa_disponible
+      FROM recompensas
+      WHERE cliente_id = $1
+      FOR UPDATE;
+      `,
+      [clienteId]
+    );
+
+    const recompensaActual = recompensaResult.rows[0];
+
+    if (recompensaActual.recompensa_disponible) {
+      await cliente.query("COMMIT");
+      await emitirRecompensaCliente(clienteId);
+      return;
+    }
+
+    const pedidoContadoResult = await cliente.query(
+      `
+      INSERT INTO recompensa_pedidos_contados (cliente_id, pedido_id)
+      VALUES ($1, $2)
+      ON CONFLICT (cliente_id, pedido_id) DO NOTHING
+      RETURNING pedido_id;
+      `,
+      [clienteId, pedidoId]
+    );
+
+    // Si no regresó filas, ese pedido ya había sumado punto.
+    if (pedidoContadoResult.rows.length === 0) {
+      await cliente.query("COMMIT");
+      await emitirRecompensaCliente(clienteId);
+      return;
+    }
+
+    const actualizadoResult = await cliente.query(
+      `
+      UPDATE recompensas
+      SET
+        pedidos_completados = LEAST(pedidos_completados + 1, meta),
+        recompensa_disponible = (LEAST(pedidos_completados + 1, meta) >= meta),
+        fecha_actualizacion = NOW()
+      WHERE cliente_id = $1
+      RETURNING pedidos_completados, meta, recompensa_disponible;
+      `,
+      [clienteId]
+    );
+
+    await cliente.query("COMMIT");
+
+    await emitirRecompensaCliente(clienteId);
+
+    console.log("⭐ Recompensa actualizada:", {
+      clienteId,
+      pedidosCompletados: actualizadoResult.rows[0].pedidos_completados,
+      recompensaDisponible: actualizadoResult.rows[0].recompensa_disponible,
+      guardadoEn: "PostgreSQL",
+    });
+  } catch (error) {
+    await cliente.query("ROLLBACK");
+    console.log("⚠️ Error guardando recompensa en DB:", error.message);
+    await registrarPedidoEntregadoLocal(pedido);
+  } finally {
+    cliente.release();
+  }
+}
+
+async function usarRecompensaClienteLocal(clienteId) {
+  const recompensa = obtenerRecompensaClienteLocal(clienteId);
 
   if (!recompensa?.recompensaDisponible) {
     return {
@@ -151,12 +365,58 @@ function usarRecompensaCliente(clienteId) {
   // Importante: NO borramos pedidosContados para evitar que pedidos viejos
   // vuelvan a sumar si se actualizan otra vez.
   guardarRecompensas();
-  emitirRecompensaCliente(clienteId);
+  await emitirRecompensaCliente(clienteId);
 
   return {
     ok: true,
     mensaje: "Recompensa usada correctamente.",
   };
+}
+
+async function usarRecompensaCliente(clienteId) {
+  if (!clienteId) {
+    return {
+      ok: false,
+      mensaje: "Cliente no válido.",
+    };
+  }
+
+  if (!baseDatosLista) {
+    return usarRecompensaClienteLocal(clienteId);
+  }
+
+  try {
+    const resultado = await pool.query(
+      `
+      UPDATE recompensas
+      SET
+        pedidos_completados = 0,
+        recompensa_disponible = FALSE,
+        fecha_actualizacion = NOW()
+      WHERE cliente_id = $1
+        AND recompensa_disponible = TRUE
+      RETURNING cliente_id;
+      `,
+      [clienteId]
+    );
+
+    if (resultado.rows.length === 0) {
+      return {
+        ok: false,
+        mensaje: "No tienes una recompensa disponible.",
+      };
+    }
+
+    await emitirRecompensaCliente(clienteId);
+
+    return {
+      ok: true,
+      mensaje: "Recompensa usada correctamente.",
+    };
+  } catch (error) {
+    console.log("⚠️ Error usando recompensa en DB:", error.message);
+    return usarRecompensaClienteLocal(clienteId);
+  }
 }
 
 // 🍀 Configuración de promociones
@@ -232,12 +492,14 @@ io.on("connection", (socket) => {
     );
 
     // ⭐ Enviar estado de recompensas al cliente
-    emitirRecompensaCliente(clienteId);
+    emitirRecompensaCliente(clienteId).catch((error) => {
+      console.log("⚠️ Error enviando recompensa:", error.message);
+    });
   }
 
   // ⭐ Cliente pide consultar sus recompensas
-  socket.on("obtener-recompensa", (callback) => {
-    const respuesta = obtenerRecompensaPublica(clienteId);
+  socket.on("obtener-recompensa", async (callback) => {
+    const respuesta = await obtenerRecompensaPublica(clienteId);
 
     socket.emit("recompensa-actualizada", respuesta);
 
@@ -256,16 +518,16 @@ io.on("connection", (socket) => {
   });
 
   // 📦 NUEVO PEDIDO
-  socket.on("nuevo-pedido", (data) => {
+  socket.on("nuevo-pedido", async (data) => {
     let recompensaPedido = {
       usada: false,
       tipo: null,
     };
 
-    // ⭐ En pasos siguientes el cliente podrá mandar data.recompensa.usar = true
+    // ⭐ El cliente puede mandar data.recompensa.usar = true
     // para aplicar su envío gratis.
     if (data.recompensa?.usar === true) {
-      const resultadoRecompensa = usarRecompensaCliente(data.clienteId);
+      const resultadoRecompensa = await usarRecompensaCliente(data.clienteId);
 
       if (resultadoRecompensa.ok) {
         recompensaPedido = {
@@ -296,7 +558,7 @@ io.on("connection", (socket) => {
   });
 
   // 🔄 CAMBIAR ESTADO
-  socket.on("cambiar-estado", (pedidoActualizado) => {
+  socket.on("cambiar-estado", async (pedidoActualizado) => {
     const pedidoAnterior = pedidos.find((p) => p.id === pedidoActualizado.id);
 
     const actualizado = {
@@ -319,7 +581,7 @@ io.on("connection", (socket) => {
     );
 
     // ⭐ Sumar recompensa cuando el pedido se marca como entregado
-    registrarPedidoEntregado(actualizado);
+    await registrarPedidoEntregado(actualizado);
   });
 
   // ❌ CANCELAR
@@ -438,6 +700,12 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3001;
 
-server.listen(PORT, () => {
-  console.log("🚀 Servidor Socket.io corriendo en puerto " + PORT);
-});
+async function iniciarServidor() {
+  await inicializarBaseDatos();
+
+  server.listen(PORT, () => {
+    console.log("🚀 Servidor Socket.io corriendo en puerto " + PORT);
+  });
+}
+
+iniciarServidor();

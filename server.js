@@ -4,6 +4,8 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
 
 let Pool = null;
 
@@ -122,8 +124,18 @@ async function inicializarBaseDatos() {
       );
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS clientes (
+        cliente_id TEXT PRIMARY KEY,
+        telefono TEXT UNIQUE NOT NULL,
+        nombre TEXT,
+        pin_hash TEXT NOT NULL,
+        fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
     baseDatosLista = true;
-    console.log("✅ Base de datos PostgreSQL lista para recompensas.");
+    console.log("✅ Base de datos PostgreSQL lista para recompensas y clientes.");
   } catch (error) {
     baseDatosLista = false;
     console.log("⚠️ No se pudo inicializar PostgreSQL. Usando recompensas.json:", error.message);
@@ -418,6 +430,174 @@ async function usarRecompensaCliente(clienteId) {
     return usarRecompensaClienteLocal(clienteId);
   }
 }
+
+// 👤 Limpia el teléfono para guardar solo números
+function limpiarTelefono(telefono) {
+  return String(telefono || "").replace(/\D/g, "");
+}
+
+// 🔐 Solo permitimos PIN de 4 a 6 números
+function validarPin(pin) {
+  return /^\d{4,6}$/.test(String(pin || ""));
+}
+
+// 👤 Registrar cliente con teléfono + PIN
+app.post("/auth/registrar", async (req, res) => {
+  try {
+    if (!baseDatosLista || !pool) {
+      return res.status(500).json({
+        ok: false,
+        mensaje: "Base de datos no disponible.",
+      });
+    }
+
+    const nombre = String(req.body.nombre || "").trim();
+    const telefono = limpiarTelefono(req.body.telefono);
+    const pin = String(req.body.pin || "").trim();
+    const clienteIdActual = String(req.body.clienteIdActual || "").trim();
+
+    if (!nombre) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "Escribe tu nombre.",
+      });
+    }
+
+    if (telefono.length < 10) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "Escribe un número de teléfono válido.",
+      });
+    }
+
+    if (!validarPin(pin)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "El PIN debe tener de 4 a 6 números.",
+      });
+    }
+
+    const existe = await pool.query(
+      "SELECT cliente_id FROM clientes WHERE telefono = $1",
+      [telefono]
+    );
+
+    if (existe.rows.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        mensaje: "Ese teléfono ya está registrado. Inicia sesión.",
+      });
+    }
+
+    const clienteId = clienteIdActual || crypto.randomUUID();
+    const pinHash = await bcrypt.hash(pin, 10);
+
+    await pool.query(
+      `
+      INSERT INTO clientes (cliente_id, telefono, nombre, pin_hash)
+      VALUES ($1, $2, $3, $4)
+      `,
+      [clienteId, telefono, nombre, pinHash]
+    );
+
+    await pool.query(
+      `
+      INSERT INTO recompensas (cliente_id)
+      VALUES ($1)
+      ON CONFLICT (cliente_id) DO NOTHING
+      `,
+      [clienteId]
+    );
+
+    const recompensa = await obtenerRecompensaPublica(clienteId);
+
+    res.json({
+      ok: true,
+      mensaje: "Cliente registrado correctamente.",
+      cliente: {
+        clienteId,
+        nombre,
+        telefono,
+      },
+      recompensa,
+    });
+  } catch (error) {
+    console.log("⚠️ Error registrando cliente:", error.message);
+
+    res.status(500).json({
+      ok: false,
+      mensaje: "No se pudo registrar el cliente.",
+    });
+  }
+});
+
+// 🔐 Login con teléfono + PIN
+app.post("/auth/login", async (req, res) => {
+  try {
+    if (!baseDatosLista || !pool) {
+      return res.status(500).json({
+        ok: false,
+        mensaje: "Base de datos no disponible.",
+      });
+    }
+
+    const telefono = limpiarTelefono(req.body.telefono);
+    const pin = String(req.body.pin || "").trim();
+
+    if (telefono.length < 10 || !validarPin(pin)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "Teléfono o PIN inválido.",
+      });
+    }
+
+    const resultado = await pool.query(
+      `
+      SELECT cliente_id, telefono, nombre, pin_hash
+      FROM clientes
+      WHERE telefono = $1
+      `,
+      [telefono]
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: "Teléfono o PIN incorrecto.",
+      });
+    }
+
+    const cliente = resultado.rows[0];
+    const pinCorrecto = await bcrypt.compare(pin, cliente.pin_hash);
+
+    if (!pinCorrecto) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: "Teléfono o PIN incorrecto.",
+      });
+    }
+
+    const recompensa = await obtenerRecompensaPublica(cliente.cliente_id);
+
+    res.json({
+      ok: true,
+      mensaje: "Inicio de sesión correcto.",
+      cliente: {
+        clienteId: cliente.cliente_id,
+        nombre: cliente.nombre,
+        telefono: cliente.telefono,
+      },
+      recompensa,
+    });
+  } catch (error) {
+    console.log("⚠️ Error iniciando sesión:", error.message);
+
+    res.status(500).json({
+      ok: false,
+      mensaje: "No se pudo iniciar sesión.",
+    });
+  }
+});
 
 // 🍀 Configuración de promociones
 const promociones = {

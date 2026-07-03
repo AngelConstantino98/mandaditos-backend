@@ -489,16 +489,33 @@ app.post("/auth/registrar", async (req, res) => {
       });
     }
 
-    const clienteId = clienteIdActual || crypto.randomUUID();
-    const pinHash = await bcrypt.hash(pin, 10);
+    let clienteId = clienteIdActual || crypto.randomUUID();
 
-    await pool.query(
-      `
-      INSERT INTO clientes (cliente_id, telefono, nombre, pin_hash)
-      VALUES ($1, $2, $3, $4)
-      `,
-      [clienteId, telefono, nombre, pinHash]
-    );
+// Si este clienteId ya fue usado por otra cuenta,
+// creamos uno nuevo para evitar error de duplicado.
+if (clienteIdActual) {
+  const clienteIdExiste = await pool.query(
+    "SELECT telefono FROM clientes WHERE cliente_id = $1",
+    [clienteIdActual]
+  );
+
+  if (
+    clienteIdExiste.rows.length > 0 &&
+    clienteIdExiste.rows[0].telefono !== telefono
+  ) {
+    clienteId = crypto.randomUUID();
+  }
+}
+
+const pinHash = await bcrypt.hash(pin, 10);
+
+await pool.query(
+  `
+  INSERT INTO clientes (cliente_id, telefono, nombre, pin_hash)
+  VALUES ($1, $2, $3, $4)
+  `,
+  [clienteId, telefono, nombre, pinHash]
+);
 
     await pool.query(
       `

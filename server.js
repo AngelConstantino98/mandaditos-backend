@@ -752,6 +752,39 @@ function obtenerProbabilidadActual() {
   return promociones.probabilidadBaja;
 }
 
+// 🕒 Convierte una fecha ISO al día de México
+function obtenerFechaMexicoDesdeISO(fechaISO) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Mexico_City",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date(fechaISO));
+  } catch {
+    return null;
+  }
+}
+
+// 🍀 Cuenta ganadores del día usando los pedidos guardados
+async function sincronizarPromocionesDesdePedidos() {
+  verificarReinicioPromociones();
+
+  const hoy = obtenerFechaMexico();
+
+  promociones.ganadoresHoy = pedidos.filter((p) => {
+    return (
+      p?.promocion?.ganador === true &&
+      p?.promocion?.fecha &&
+      obtenerFechaMexicoDesdeISO(p.promocion.fecha) === hoy
+    );
+  }).length;
+
+  console.log("🍀 Ganadores cargados desde pedidos:", {
+    fecha: hoy,
+    ganadoresHoy: promociones.ganadoresHoy,
+  });
+}
 // 🎁 Promoción vacía para cada pedido
 function crearPromocionVacia() {
   return {
@@ -914,7 +947,7 @@ io.on("connection", (socket) => {
 
   // 🍀 PROBAR SUERTE
   socket.on("probar-suerte", async ({ pedidoId }, callback) => {
-    verificarReinicioPromociones();
+    await sincronizarPromocionesDesdePedidos();
 
     const responder = (respuesta) => {
       socket.emit("resultado-promocion", respuesta);
@@ -1014,6 +1047,7 @@ const PORT = process.env.PORT || 3001;
 async function iniciarServidor() {
   await inicializarBaseDatos();
   await cargarPedidosDesdeDB();
+  await sincronizarPromocionesDesdePedidos();
 
   server.listen(PORT, () => {
     console.log("🚀 Servidor Socket.io corriendo en puerto " + PORT);
@@ -1021,3 +1055,4 @@ async function iniciarServidor() {
 }
 
 iniciarServidor();
+

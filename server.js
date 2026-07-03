@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
@@ -132,6 +132,26 @@ async function inicializarBaseDatos() {
         pin_hash TEXT NOT NULL,
         fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+        await pool.query(`
+      CREATE TABLE IF NOT EXISTS pedidos (
+        id TEXT PRIMARY KEY,
+        cliente_id TEXT NOT NULL,
+        estado TEXT NOT NULL DEFAULT 'pendiente',
+        data JSONB NOT NULL,
+        fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        fecha_actualizacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS pedidos_cliente_id_idx
+      ON pedidos(cliente_id);
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS pedidos_fecha_actualizacion_idx
+      ON pedidos(fecha_actualizacion DESC);
     `);
 
     baseDatosLista = true;
@@ -615,6 +635,75 @@ app.post("/auth/login", async (req, res) => {
     });
   }
 });
+// 📦 Guardar pedido en PostgreSQL
+async function guardarPedidoEnDB(pedido) {
+  if (!baseDatosLista || !pool || !pedido?.id || !pedido?.clienteId) {
+    return;
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO pedidos (
+        id,
+        cliente_id,
+        estado,
+        data,
+        fecha_creacion,
+        fecha_actualizacion
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4::jsonb,
+        COALESCE($5::timestamptz, NOW()),
+        NOW()
+      )
+      ON CONFLICT (id) DO UPDATE
+      SET
+        cliente_id = EXCLUDED.cliente_id,
+        estado = EXCLUDED.estado,
+        data = EXCLUDED.data,
+        fecha_actualizacion = NOW();
+      `,
+      [
+        String(pedido.id),
+        pedido.clienteId,
+        pedido.estado || "pendiente",
+        JSON.stringify(pedido),
+        pedido.fecha || null
+      ]
+    );
+        console.log("💾 Pedido guardado en PostgreSQL:", pedido.id);
+  } catch (error) {
+    console.log("⚠️ No se pudo guardar pedido en PostgreSQL:", error.message);
+  }
+}
+
+// 📚 Cargar pedidos guardados al iniciar el backend
+async function cargarPedidosDesdeDB() {
+  if (!baseDatosLista || !pool) {
+    return;
+  }
+
+  try {
+    const resultado = await pool.query(`
+      SELECT data
+      FROM pedidos
+      ORDER BY fecha_creacion DESC
+      LIMIT 300;
+    `);
+
+    pedidos = resultado.rows
+      .map((row) => row.data)
+      .filter(Boolean);
+
+    console.log("📚 Pedidos cargados desde PostgreSQL:", pedidos.length);
+  } catch (error) {
+    console.log("⚠️ No se pudieron cargar pedidos desde PostgreSQL:", error.message);
+  }
+}
 
 // 🍀 Configuración de promociones
 const promociones = {
@@ -685,7 +774,7 @@ io.on("connection", (socket) => {
 
     socket.emit(
       "pedidos-iniciales",
-      pedidos.filter((p) => p.clienteId === clienteId)
+      pedidos.filter((p) => String(p.clienteId) === String(clienteId))
     );
 
     // ⭐ Enviar estado de recompensas al cliente
@@ -743,7 +832,12 @@ io.on("connection", (socket) => {
       recompensa: recompensaPedido,
     };
 
-    pedidos.push(pedido);
+    pedidos = [
+      pedido,
+      ...pedidos.filter((p) => String(p.id) !== String(pedido.id)),
+    ].slice(0, 300);
+
+    await guardarPedidoEnDB(pedido);
 
     // 👤 SOLO cliente dueño
     io.to(pedido.clienteId).emit("pedido-actualizado", pedido);
@@ -756,16 +850,28 @@ io.on("connection", (socket) => {
 
   // 🔄 CAMBIAR ESTADO
   socket.on("cambiar-estado", async (pedidoActualizado) => {
-    const pedidoAnterior = pedidos.find((p) => p.id === pedidoActualizado.id);
+    const pedidoAnterior = pedidos.find(
+      (p) => String(p.id) === String(pedidoActualizado.id)
+    );
 
     const actualizado = {
       ...(pedidoAnterior || {}),
       ...pedidoActualizado,
     };
 
-    pedidos = pedidos.map((p) =>
-      p.id === actualizado.id ? actualizado : p
+    const existePedido = pedidos.some(
+      (p) => String(p.id) === String(actualizado.id)
     );
+
+    pedidos = existePedido
+      ? pedidos.map((p) =>
+          String(p.id) === String(actualizado.id) ? actualizado : p
+        )
+      : [actualizado, ...pedidos];
+
+    pedidos = pedidos.slice(0, 300);
+
+    await guardarPedidoEnDB(actualizado);
 
     io.to(actualizado.clienteId).emit(
       "pedido-actualizado",
@@ -782,14 +888,18 @@ io.on("connection", (socket) => {
   });
 
   // ❌ CANCELAR
-  socket.on("cancelar-pedido", (data) => {
+  socket.on("cancelar-pedido", async (data) => {
     pedidos = pedidos.map((p) =>
-      p.id === data.id ? { ...p, estado: "cancelado" } : p
+      String(p.id) === String(data.id) ? { ...p, estado: "cancelado" } : p
     );
 
-    const actualizado = pedidos.find((p) => p.id === data.id);
+    const actualizado = pedidos.find(
+      (p) => String(p.id) === String(data.id)
+    );
 
     if (actualizado) {
+      await guardarPedidoEnDB(actualizado);
+
       io.to(actualizado.clienteId).emit(
         "pedido-actualizado",
         actualizado
@@ -803,7 +913,7 @@ io.on("connection", (socket) => {
   });
 
   // 🍀 PROBAR SUERTE
-  socket.on("probar-suerte", ({ pedidoId }, callback) => {
+  socket.on("probar-suerte", async ({ pedidoId }, callback) => {
     verificarReinicioPromociones();
 
     const responder = (respuesta) => {
@@ -814,7 +924,9 @@ io.on("connection", (socket) => {
       }
     };
 
-    const pedido = pedidos.find((p) => p.id === pedidoId);
+    const pedido = pedidos.find(
+      (p) => String(p.id) === String(pedidoId)
+    );
 
     // El pedido no existe
     if (!pedido) {
@@ -861,6 +973,8 @@ io.on("connection", (socket) => {
       pedido.promocion.premio = "Pedido Gratis";
     }
 
+    await guardarPedidoEnDB(pedido);
+
     // Avisar al cliente
     io.to(pedido.clienteId).emit("pedido-actualizado", pedido);
 
@@ -899,6 +1013,7 @@ const PORT = process.env.PORT || 3001;
 
 async function iniciarServidor() {
   await inicializarBaseDatos();
+  await cargarPedidosDesdeDB();
 
   server.listen(PORT, () => {
     console.log("🚀 Servidor Socket.io corriendo en puerto " + PORT);

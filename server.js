@@ -134,6 +134,9 @@ const HORARIOS_NEGOCIOS = {
   "monsis-fresas": [
     { dias: [0, 2, 3, 4, 5, 6], abre: "16:00", cierra: "21:00" },
   ],
+  "cocteleria-juanito": [
+    { dias: [0, 1, 2, 3, 4, 5, 6], abre: "10:00", cierra: "20:00" },
+  ],
   "papeleria-las-gueras": [
     { dias: [1, 2, 3, 4, 5], abre: "08:00", cierra: "20:00" },
     { dias: [0, 6], abre: "08:00", cierra: "16:00" },

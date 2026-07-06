@@ -88,6 +88,35 @@ function guardarEntregasRepartidor() {
 
 let entregasRepartidor = cargarEntregasRepartidor();
 
+// 🏪 Archivo simple de respaldo para abrir/cerrar negocios
+const NEGOCIOS_ESTADO_FILE = path.join(__dirname, "negocios_estado.json");
+
+function cargarEstadoNegociosLocal() {
+  try {
+    if (fs.existsSync(NEGOCIOS_ESTADO_FILE)) {
+      return JSON.parse(fs.readFileSync(NEGOCIOS_ESTADO_FILE, "utf8"));
+    }
+  } catch (error) {
+    console.log("⚠️ No se pudo cargar estado de negocios:", error.message);
+  }
+
+  return {};
+}
+
+function guardarEstadoNegociosLocal() {
+  try {
+    fs.writeFileSync(
+      NEGOCIOS_ESTADO_FILE,
+      JSON.stringify(estadoNegociosLocal, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.log("⚠️ No se pudo guardar estado de negocios:", error.message);
+  }
+}
+
+let estadoNegociosLocal = cargarEstadoNegociosLocal();
+
 const DATABASE_URL = process.env.DATABASE_URL;
 let pool = null;
 let baseDatosLista = false;
@@ -231,6 +260,15 @@ async function inicializarBaseDatos() {
         [repartidor.id, repartidor.nombre]
       );
     }
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS negocios_estado (
+        negocio_id TEXT PRIMARY KEY,
+        negocio_nombre TEXT NOT NULL,
+        abierto BOOLEAN NOT NULL DEFAULT TRUE,
+        fecha_actualizacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
     baseDatosLista = true;
     console.log("✅ Base de datos PostgreSQL lista para recompensas y clientes.");
@@ -969,6 +1007,160 @@ async function actualizarEstadoServicioRepartidor(repartidorId, disponible) {
   }
 }
 
+// 🏪 Estado abierto/cerrado por negocio
+function normalizarEstadoNegocios(rows = []) {
+  return {
+    negocios: rows.map((item) => ({
+      negocioId: String(item.negocioId || "").trim(),
+      negocioNombre: item.negocioNombre || "",
+      abierto: item.abierto !== false,
+      fechaActualizacion: item.fechaActualizacion || null,
+    })),
+  };
+}
+
+async function obtenerEstadoNegocios() {
+  if (!baseDatosLista || !pool) {
+    return normalizarEstadoNegocios(Object.values(estadoNegociosLocal));
+  }
+
+  try {
+    const resultado = await pool.query(`
+      SELECT negocio_id, negocio_nombre, abierto, fecha_actualizacion
+      FROM negocios_estado
+      ORDER BY negocio_nombre ASC;
+    `);
+
+    return normalizarEstadoNegocios(
+      resultado.rows.map((row) => ({
+        negocioId: row.negocio_id,
+        negocioNombre: row.negocio_nombre,
+        abierto: row.abierto,
+        fechaActualizacion: row.fecha_actualizacion,
+      }))
+    );
+  } catch (error) {
+    console.log("⚠️ No se pudo consultar estado de negocios:", error.message);
+    return normalizarEstadoNegocios(Object.values(estadoNegociosLocal));
+  }
+}
+
+async function negocioEstaAbierto(negocioId) {
+  const id = String(negocioId || "").trim();
+
+  if (!id) return true;
+
+  if (!baseDatosLista || !pool) {
+    return estadoNegociosLocal[id]?.abierto !== false;
+  }
+
+  try {
+    const resultado = await pool.query(
+      `
+      SELECT abierto
+      FROM negocios_estado
+      WHERE negocio_id = $1
+      LIMIT 1;
+      `,
+      [id]
+    );
+
+    if (resultado.rows.length === 0) {
+      return true;
+    }
+
+    return resultado.rows[0].abierto !== false;
+  } catch (error) {
+    console.log("⚠️ No se pudo validar negocio abierto:", error.message);
+    return estadoNegociosLocal[id]?.abierto !== false;
+  }
+}
+
+async function validarNegociosAbiertos(negociosIds = []) {
+  const ids = [...new Set((negociosIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+
+  for (const id of ids) {
+    const abierto = await negocioEstaAbierto(id);
+
+    if (!abierto) {
+      return {
+        ok: false,
+        negocioId: id,
+        mensaje: "Este negocio está cerrado por el momento. Intenta más tarde.",
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+async function actualizarEstadoNegocio(negocioId, negocioNombre, abierto) {
+  const id = String(negocioId || "").trim();
+  const nombre = String(negocioNombre || id || "Negocio").trim();
+  const abiertoFinal = Boolean(abierto);
+
+  if (!id) {
+    return {
+      ok: false,
+      mensaje: "Negocio no válido.",
+    };
+  }
+
+  if (!baseDatosLista || !pool) {
+    estadoNegociosLocal[id] = {
+      negocioId: id,
+      negocioNombre: nombre,
+      abierto: abiertoFinal,
+      fechaActualizacion: new Date().toISOString(),
+    };
+
+    guardarEstadoNegociosLocal();
+
+    const estado = await obtenerEstadoNegocios();
+    io.emit("negocios-actualizados", estado);
+
+    return {
+      ok: true,
+      estado,
+    };
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO negocios_estado (
+        negocio_id,
+        negocio_nombre,
+        abierto,
+        fecha_actualizacion
+      )
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (negocio_id) DO UPDATE
+      SET
+        negocio_nombre = EXCLUDED.negocio_nombre,
+        abierto = EXCLUDED.abierto,
+        fecha_actualizacion = NOW();
+      `,
+      [id, nombre, abiertoFinal]
+    );
+
+    const estado = await obtenerEstadoNegocios();
+    io.emit("negocios-actualizados", estado);
+
+    return {
+      ok: true,
+      estado,
+    };
+  } catch (error) {
+    console.log("⚠️ No se pudo actualizar estado de negocio:", error.message);
+
+    return {
+      ok: false,
+      mensaje: "No se pudo actualizar el estado del negocio.",
+    };
+  }
+}
+
 function obtenerFechaHoraMexico() {
   return new Intl.DateTimeFormat("sv-SE", {
     timeZone: "America/Mexico_City",
@@ -1106,6 +1298,65 @@ app.post("/dueno/login", (req, res) => {
 });
 
 // 👑 Resumen de entregas para el dueño
+app.post("/dueno/estado-negocios", async (req, res) => {
+  try {
+    const { usuario, pin } = req.body || {};
+
+    if (!validarCredencialesDueno(usuario, pin)) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: "Credenciales incorrectas.",
+      });
+    }
+
+    const estado = await obtenerEstadoNegocios();
+
+    return res.json({
+      ok: true,
+      estado,
+    });
+  } catch (error) {
+    console.log("Error estado negocios dueño:", error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: "No se pudo cargar el estado de negocios.",
+    });
+  }
+});
+
+app.post("/dueno/cambiar-negocio", async (req, res) => {
+  try {
+    const { usuario, pin, negocioId, negocioNombre, abierto } = req.body || {};
+
+    if (!validarCredencialesDueno(usuario, pin)) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: "Credenciales incorrectas.",
+      });
+    }
+
+    const resultado = await actualizarEstadoNegocio(
+      negocioId,
+      negocioNombre,
+      Boolean(abierto)
+    );
+
+    if (!resultado.ok) {
+      return res.status(400).json(resultado);
+    }
+
+    return res.json(resultado);
+  } catch (error) {
+    console.log("Error cambiando negocio:", error);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: "No se pudo actualizar el negocio.",
+    });
+  }
+});
+
 app.post("/dueno/resumen-entregas", async (req, res) => {
   try {
     const usuario = String(req.body.usuario || "").trim();
@@ -1502,6 +1753,12 @@ io.on("connection", (socket) => {
       console.log("⚠️ Error enviando estado de servicio:", error.message);
     });
 
+  obtenerEstadoNegocios()
+    .then((estado) => socket.emit("negocios-actualizados", estado))
+    .catch((error) => {
+      console.log("⚠️ Error enviando estado de negocios:", error.message);
+    });
+
   const clienteId = socket.handshake.query.clienteId;
 
   // 👤 CLIENTES → room privado
@@ -1536,6 +1793,17 @@ io.on("connection", (socket) => {
     const estado = await obtenerEstadoServicio();
     socket.emit("servicio-actualizado", estado);
     if (typeof callback === "function") callback(estado);
+  });
+
+  // 🏪 Consultar negocios abiertos/cerrados
+  socket.on("obtener-negocios-estado", async (callback) => {
+    const estado = await obtenerEstadoNegocios();
+
+    socket.emit("negocios-actualizados", estado);
+
+    if (typeof callback === "function") {
+      callback(estado);
+    }
   });
 
   // 🛵 Repartidor cambia disponible / fuera de servicio
@@ -1576,6 +1844,24 @@ io.on("connection", (socket) => {
 
       socket.emit("pedido-rechazado", { ok: false, mensaje });
       responderNuevoPedido({ ok: false, mensaje });
+
+      return;
+    }
+
+    const validacionNegocios = await validarNegociosAbiertos(data?.negociosIds || []);
+
+    if (!validacionNegocios.ok) {
+      socket.emit("pedido-rechazado", {
+        ok: false,
+        mensaje: validacionNegocios.mensaje,
+        negocioId: validacionNegocios.negocioId,
+      });
+
+      responderNuevoPedido({
+        ok: false,
+        mensaje: validacionNegocios.mensaje,
+        negocioId: validacionNegocios.negocioId,
+      });
 
       return;
     }

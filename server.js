@@ -546,6 +546,174 @@ const REPARTIDORES = [
   { id: "chalan", nombre: "Chalan", pin: "2026" },
 ];
 
+// 👑 Dueño autorizado para ver cuentas internas
+const DUENO = {
+  usuario: "constantino",
+  nombre: "Constantino",
+  pin: "1998",
+};
+
+function validarCredencialesDueno(usuario, pin) {
+  return (
+    limpiarTextoAcceso(usuario) === limpiarTextoAcceso(DUENO.usuario) &&
+    String(pin || "").trim() === DUENO.pin
+  );
+}
+
+function crearResumenVacioRepartidores() {
+  return REPARTIDORES.map((repartidor) => ({
+    repartidorId: repartidor.id,
+    repartidorNombre: repartidor.nombre,
+    entregas: 0,
+    totalDueno: 0,
+  }));
+}
+
+function ordenarResumenRepartidores(resumen) {
+  const orden = REPARTIDORES.map((repartidor) => repartidor.id);
+
+  return [...resumen].sort((a, b) => {
+    const indexA = orden.indexOf(a.repartidorId);
+    const indexB = orden.indexOf(b.repartidorId);
+
+    if (indexA === -1 && indexB === -1) {
+      return String(a.repartidorNombre).localeCompare(String(b.repartidorNombre));
+    }
+
+    if (indexA === -1) return 1;
+    if (indexB === -1) return -1;
+
+    return indexA - indexB;
+  });
+}
+
+async function obtenerResumenEntregasDueno(fechaConsulta) {
+  const fecha = fechaConsulta || obtenerFechaMexico();
+
+  if (!baseDatosLista || !pool) {
+    const detalles = entregasRepartidor
+      .filter((entrega) => String(entrega.fechaMexico || "").startsWith(fecha))
+      .map((entrega) => ({
+        pedidoId: entrega.pedidoId,
+        repartidorId: entrega.repartidorId,
+        repartidorNombre: entrega.repartidorNombre,
+        clienteNombre: entrega.clienteNombre || "",
+        zona: entrega.zona || "",
+        costo: entrega.costo || "",
+        comisionDueno: Number(entrega.comisionDueno || 10),
+        hora: String(entrega.fechaMexico || "").slice(11, 16),
+        fechaEntrega: entrega.fechaEntrega,
+      }));
+
+    const resumenMap = new Map();
+
+    crearResumenVacioRepartidores().forEach((item) => {
+      resumenMap.set(item.repartidorId, item);
+    });
+
+    detalles.forEach((entrega) => {
+      if (!resumenMap.has(entrega.repartidorId)) {
+        resumenMap.set(entrega.repartidorId, {
+          repartidorId: entrega.repartidorId,
+          repartidorNombre: entrega.repartidorNombre,
+          entregas: 0,
+          totalDueno: 0,
+        });
+      }
+
+      const actual = resumenMap.get(entrega.repartidorId);
+      actual.entregas += 1;
+      actual.totalDueno += Number(entrega.comisionDueno || 10);
+    });
+
+    const resumen = ordenarResumenRepartidores([...resumenMap.values()]);
+    const totalGeneral = resumen.reduce((total, item) => total + item.totalDueno, 0);
+    const totalEntregas = resumen.reduce((total, item) => total + item.entregas, 0);
+
+    return {
+      fecha,
+      resumen,
+      detalles,
+      totalGeneral,
+      totalEntregas,
+    };
+  }
+
+  const resumenResult = await pool.query(
+    `
+    SELECT
+      repartidor_id,
+      repartidor_nombre,
+      COUNT(*)::int AS entregas,
+      COALESCE(SUM(comision_dueno), 0)::int AS total_dueno
+    FROM entregas_repartidor
+    WHERE (fecha_entrega AT TIME ZONE 'America/Mexico_City')::date = $1::date
+    GROUP BY repartidor_id, repartidor_nombre
+    ORDER BY repartidor_nombre ASC;
+    `,
+    [fecha]
+  );
+
+  const detallesResult = await pool.query(
+    `
+    SELECT
+      pedido_id,
+      repartidor_id,
+      repartidor_nombre,
+      cliente_nombre,
+      zona,
+      costo,
+      comision_dueno,
+      TO_CHAR(fecha_entrega AT TIME ZONE 'America/Mexico_City', 'HH24:MI') AS hora,
+      fecha_entrega
+    FROM entregas_repartidor
+    WHERE (fecha_entrega AT TIME ZONE 'America/Mexico_City')::date = $1::date
+    ORDER BY fecha_entrega DESC;
+    `,
+    [fecha]
+  );
+
+  const resumenMap = new Map();
+
+  crearResumenVacioRepartidores().forEach((item) => {
+    resumenMap.set(item.repartidorId, item);
+  });
+
+  resumenResult.rows.forEach((row) => {
+    resumenMap.set(row.repartidor_id, {
+      repartidorId: row.repartidor_id,
+      repartidorNombre: row.repartidor_nombre,
+      entregas: Number(row.entregas || 0),
+      totalDueno: Number(row.total_dueno || 0),
+    });
+  });
+
+  const resumen = ordenarResumenRepartidores([...resumenMap.values()]);
+
+  const detalles = detallesResult.rows.map((row) => ({
+    pedidoId: row.pedido_id,
+    repartidorId: row.repartidor_id,
+    repartidorNombre: row.repartidor_nombre,
+    clienteNombre: row.cliente_nombre || "",
+    zona: row.zona || "",
+    costo: row.costo || "",
+    comisionDueno: Number(row.comision_dueno || 10),
+    hora: row.hora,
+    fechaEntrega: row.fecha_entrega,
+  }));
+
+  const totalGeneral = resumen.reduce((total, item) => total + item.totalDueno, 0);
+  const totalEntregas = resumen.reduce((total, item) => total + item.entregas, 0);
+
+  return {
+    fecha,
+    resumen,
+    detalles,
+    totalGeneral,
+    totalEntregas,
+  };
+}
+
 function limpiarTextoAcceso(valor) {
   return String(valor || "")
     .trim()
@@ -688,6 +856,58 @@ async function registrarEntregaRepartidor(pedido) {
     });
   }
 }
+
+// 👑 Login de dueño
+app.post("/dueno/login", (req, res) => {
+  const usuario = String(req.body.usuario || "").trim();
+  const pin = String(req.body.pin || "").trim();
+
+  if (!validarCredencialesDueno(usuario, pin)) {
+    return res.status(401).json({
+      ok: false,
+      mensaje: "Usuario o PIN de dueño incorrecto.",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    mensaje: "Inicio de sesión de dueño correcto.",
+    dueno: {
+      usuario: DUENO.usuario,
+      nombre: DUENO.nombre,
+    },
+  });
+});
+
+// 👑 Resumen de entregas para el dueño
+app.post("/dueno/resumen-entregas", async (req, res) => {
+  try {
+    const usuario = String(req.body.usuario || "").trim();
+    const pin = String(req.body.pin || "").trim();
+    const fecha = String(req.body.fecha || obtenerFechaMexico()).trim();
+
+    if (!validarCredencialesDueno(usuario, pin)) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: "No autorizado.",
+      });
+    }
+
+    const resumen = await obtenerResumenEntregasDueno(fecha);
+
+    return res.json({
+      ok: true,
+      ...resumen,
+    });
+  } catch (error) {
+    console.log("⚠️ Error obteniendo resumen de dueño:", error.message);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: "No se pudo obtener el resumen de entregas.",
+    });
+  }
+});
 
 // 🛵 Login de repartidor
 app.post("/repartidor/login", (req, res) => {

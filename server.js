@@ -845,9 +845,9 @@ io.on("connection", (socket) => {
 
     const recompensaActual = await obtenerRecompensaPublica(data.clienteId);
 
-    // ⭐ Si el cliente ya tiene recompensa disponible, se aplica automáticamente
-    // en su siguiente pedido. También respetamos data.recompensa.usar = true
-    // por si después agregamos un botón manual en el frontend.
+    // ⭐ Si el cliente ya tiene recompensa disponible, se marca automáticamente
+    // como cupón de $20 para el envío en el siguiente pedido.
+    // No modificamos el costo automáticamente porque el envío se cobra en persona.
     const debeUsarRecompensa =
       data.recompensa?.usar === true ||
       recompensaActual?.recompensaDisponible === true;
@@ -858,24 +858,23 @@ io.on("connection", (socket) => {
       if (resultadoRecompensa.ok) {
         recompensaPedido = {
           usada: true,
-          tipo: "envio-gratis-10-pedidos",
-          mensaje: "ENVÍO GRATIS POR RECOMPENSA",
+          tipo: "cupon-20-envio-10-pedidos",
+          monto: 20,
+          mensaje: "CUPÓN DE $20 PARA ENVÍO",
         };
       }
     }
 
-    const costoOriginal = data.costo;
+    const pedidoTextoConRecompensa = recompensaPedido.usada
+      ? `${data.pedido}\n\n🎁 Cupón de recompensa: -$20 en el envío.`
+      : data.pedido;
 
     const pedido = {
       ...data,
       id: data.id || Date.now(),
+      pedido: pedidoTextoConRecompensa,
       estado: "pendiente",
-      costo: recompensaPedido.usada
-        ? "GRATIS (recompensa 10 pedidos)"
-        : data.costo,
-      costoOriginal: recompensaPedido.usada
-        ? costoOriginal
-        : data.costoOriginal,
+      costo: data.costo,
       promocion: crearPromocionVacia(),
       recompensa: recompensaPedido,
     };

@@ -12,13 +12,22 @@
     "fechaActualizacion": "2026-07-02T22:23:59.359Z"
   },
   "91c697ab-bf6f-4f51-b4d6-9352e485fdbc": {
-    "pedidosCompletados": 2,
+    "pedidosCompletados": 1,
     "meta": 10,
     "recompensaDisponible": false,
     "pedidosContados": [
       "1783182986954",
-      "1783182921426"
+      "1783182921426",
+      "1783306042391",
+      "1783306031391",
+      "1783306018255",
+      "1783306006359",
+      "1783305996472",
+      "1783306062671",
+      "1783306069568",
+      "1783306075455",
+      "1783306141495"
     ],
-    "fechaActualizacion": "2026-07-04T16:37:15.970Z"
+    "fechaActualizacion": "2026-07-06T02:49:22.800Z"
   }
 }

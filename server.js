@@ -117,6 +117,92 @@ function guardarEstadoNegociosLocal() {
 
 let estadoNegociosLocal = cargarEstadoNegociosLocal();
 
+// 🕒 Horarios automáticos de negocios (hora de Chiapas / México)
+const HORARIOS_NEGOCIOS = {
+  "pasteleria-oscarin": [
+    { dias: [0, 1, 2, 3, 4, 5, 6], abre: "08:00", cierra: "20:00" },
+  ],
+  "antojitos-la-bendicion-de-dios": [
+    { dias: [0, 1, 2, 3, 4, 5, 6], abre: "17:00", cierra: "23:30" },
+  ],
+  "cockteleria-la-almeja-2": [
+    { dias: [0, 1, 3, 4, 5, 6], abre: "12:00", cierra: "18:00" },
+  ],
+  "tortas-el-guero": [
+    { dias: [0, 1, 2, 3, 4, 5, 6], abre: "07:30", cierra: "23:00" },
+  ],
+  "monsis-fresas": [
+    { dias: [0, 2, 3, 4, 5, 6], abre: "16:00", cierra: "21:00" },
+  ],
+  "papeleria-las-gueras": [
+    { dias: [1, 2, 3, 4, 5], abre: "08:00", cierra: "20:00" },
+    { dias: [0, 6], abre: "08:00", cierra: "16:00" },
+  ],
+};
+
+function horaAMinutos(hora = "00:00") {
+  const [horas, minutos] = String(hora).split(":").map(Number);
+  return (horas || 0) * 60 + (minutos || 0);
+}
+
+function obtenerAhoraMexico() {
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Mexico_City",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+
+  const mapa = {};
+  partes.forEach((parte) => {
+    mapa[parte.type] = parte.value;
+  });
+
+  const dias = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+
+  return {
+    dia: dias[mapa.weekday] ?? new Date().getDay(),
+    minutos: Number(mapa.hour || 0) * 60 + Number(mapa.minute || 0),
+  };
+}
+
+function calcularAbiertoPorHorario(negocioId) {
+  const horarios = HORARIOS_NEGOCIOS[String(negocioId || "").trim()] || [];
+
+  if (horarios.length === 0) {
+    return true;
+  }
+
+  const ahora = obtenerAhoraMexico();
+  let abierto = false;
+
+  horarios
+    .filter((horario) => Array.isArray(horario.dias) && horario.dias.includes(ahora.dia))
+    .forEach((horario) => {
+      const abre = horaAMinutos(horario.abre);
+      const cierra = horaAMinutos(horario.cierra);
+
+      if (cierra < abre) {
+        if (ahora.minutos >= abre || ahora.minutos < cierra) abierto = true;
+        return;
+      }
+
+      if (ahora.minutos >= abre && ahora.minutos < cierra) abierto = true;
+    });
+
+  return abierto;
+}
+
+
 const DATABASE_URL = process.env.DATABASE_URL;
 let pool = null;
 let baseDatosLista = false;
@@ -268,6 +354,11 @@ async function inicializarBaseDatos() {
         abierto BOOLEAN NOT NULL DEFAULT TRUE,
         fecha_actualizacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE negocios_estado
+      ADD COLUMN IF NOT EXISTS modo TEXT NOT NULL DEFAULT 'auto';
     `);
 
     baseDatosLista = true;
@@ -1010,12 +1101,23 @@ async function actualizarEstadoServicioRepartidor(repartidorId, disponible) {
 // 🏪 Estado abierto/cerrado por negocio
 function normalizarEstadoNegocios(rows = []) {
   return {
-    negocios: rows.map((item) => ({
-      negocioId: String(item.negocioId || "").trim(),
-      negocioNombre: item.negocioNombre || "",
-      abierto: item.abierto !== false,
-      fechaActualizacion: item.fechaActualizacion || null,
-    })),
+    negocios: rows.map((item) => {
+      const negocioId = String(item.negocioId || "").trim();
+      const modo = item.modo === "manual" ? "manual" : "auto";
+      const abiertoManual = item.abierto !== false;
+      const abiertoHorario = calcularAbiertoPorHorario(negocioId);
+      const abiertoFinal = modo === "manual" ? abiertoManual : abiertoHorario;
+
+      return {
+        negocioId,
+        negocioNombre: item.negocioNombre || "",
+        abierto: abiertoFinal,
+        abiertoManual,
+        abiertoHorario,
+        modo,
+        fechaActualizacion: item.fechaActualizacion || null,
+      };
+    }),
   };
 }
 
@@ -1026,7 +1128,7 @@ async function obtenerEstadoNegocios() {
 
   try {
     const resultado = await pool.query(`
-      SELECT negocio_id, negocio_nombre, abierto, fecha_actualizacion
+      SELECT negocio_id, negocio_nombre, abierto, modo, fecha_actualizacion
       FROM negocios_estado
       ORDER BY negocio_nombre ASC;
     `);
@@ -1036,6 +1138,7 @@ async function obtenerEstadoNegocios() {
         negocioId: row.negocio_id,
         negocioNombre: row.negocio_nombre,
         abierto: row.abierto,
+        modo: row.modo,
         fechaActualizacion: row.fecha_actualizacion,
       }))
     );
@@ -1050,14 +1153,23 @@ async function negocioEstaAbierto(negocioId) {
 
   if (!id) return true;
 
+  const abiertoHorario = calcularAbiertoPorHorario(id);
+
   if (!baseDatosLista || !pool) {
-    return estadoNegociosLocal[id]?.abierto !== false;
+    const estadoLocal = estadoNegociosLocal[id];
+    const modoLocal = estadoLocal?.modo === "manual" ? "manual" : "auto";
+
+    if (modoLocal === "manual") {
+      return estadoLocal?.abierto !== false;
+    }
+
+    return abiertoHorario;
   }
 
   try {
     const resultado = await pool.query(
       `
-      SELECT abierto
+      SELECT abierto, modo
       FROM negocios_estado
       WHERE negocio_id = $1
       LIMIT 1;
@@ -1066,13 +1178,27 @@ async function negocioEstaAbierto(negocioId) {
     );
 
     if (resultado.rows.length === 0) {
-      return true;
+      return abiertoHorario;
     }
 
-    return resultado.rows[0].abierto !== false;
+    const row = resultado.rows[0];
+    const modo = row.modo === "manual" ? "manual" : "auto";
+
+    if (modo === "manual") {
+      return row.abierto !== false;
+    }
+
+    return abiertoHorario;
   } catch (error) {
     console.log("⚠️ No se pudo validar negocio abierto:", error.message);
-    return estadoNegociosLocal[id]?.abierto !== false;
+    const estadoLocal = estadoNegociosLocal[id];
+    const modoLocal = estadoLocal?.modo === "manual" ? "manual" : "auto";
+
+    if (modoLocal === "manual") {
+      return estadoLocal?.abierto !== false;
+    }
+
+    return abiertoHorario;
   }
 }
 
@@ -1094,10 +1220,11 @@ async function validarNegociosAbiertos(negociosIds = []) {
   return { ok: true };
 }
 
-async function actualizarEstadoNegocio(negocioId, negocioNombre, abierto) {
+async function actualizarEstadoNegocio(negocioId, negocioNombre, abierto, modo = "manual") {
   const id = String(negocioId || "").trim();
   const nombre = String(negocioNombre || id || "Negocio").trim();
   const abiertoFinal = Boolean(abierto);
+  const modoFinal = modo === "auto" ? "auto" : "manual";
 
   if (!id) {
     return {
@@ -1111,6 +1238,7 @@ async function actualizarEstadoNegocio(negocioId, negocioNombre, abierto) {
       negocioId: id,
       negocioNombre: nombre,
       abierto: abiertoFinal,
+      modo: modoFinal,
       fechaActualizacion: new Date().toISOString(),
     };
 
@@ -1132,16 +1260,18 @@ async function actualizarEstadoNegocio(negocioId, negocioNombre, abierto) {
         negocio_id,
         negocio_nombre,
         abierto,
+        modo,
         fecha_actualizacion
       )
-      VALUES ($1, $2, $3, NOW())
+      VALUES ($1, $2, $3, $4, NOW())
       ON CONFLICT (negocio_id) DO UPDATE
       SET
         negocio_nombre = EXCLUDED.negocio_nombre,
         abierto = EXCLUDED.abierto,
+        modo = EXCLUDED.modo,
         fecha_actualizacion = NOW();
       `,
-      [id, nombre, abiertoFinal]
+      [id, nombre, abiertoFinal, modoFinal]
     );
 
     const estado = await obtenerEstadoNegocios();
@@ -1327,7 +1457,7 @@ app.post("/dueno/estado-negocios", async (req, res) => {
 
 app.post("/dueno/cambiar-negocio", async (req, res) => {
   try {
-    const { usuario, pin, negocioId, negocioNombre, abierto } = req.body || {};
+    const { usuario, pin, negocioId, negocioNombre, abierto, modo } = req.body || {};
 
     if (!validarCredencialesDueno(usuario, pin)) {
       return res.status(401).json({
@@ -1339,7 +1469,8 @@ app.post("/dueno/cambiar-negocio", async (req, res) => {
     const resultado = await actualizarEstadoNegocio(
       negocioId,
       negocioNombre,
-      Boolean(abierto)
+      Boolean(abierto),
+      modo
     );
 
     if (!resultado.ok) {

@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
@@ -843,9 +843,16 @@ io.on("connection", (socket) => {
       tipo: null,
     };
 
-    // ⭐ El cliente puede mandar data.recompensa.usar = true
-    // para aplicar su envío gratis.
-    if (data.recompensa?.usar === true) {
+    const recompensaActual = await obtenerRecompensaPublica(data.clienteId);
+
+    // ⭐ Si el cliente ya tiene recompensa disponible, se aplica automáticamente
+    // en su siguiente pedido. También respetamos data.recompensa.usar = true
+    // por si después agregamos un botón manual en el frontend.
+    const debeUsarRecompensa =
+      data.recompensa?.usar === true ||
+      recompensaActual?.recompensaDisponible === true;
+
+    if (debeUsarRecompensa) {
       const resultadoRecompensa = await usarRecompensaCliente(data.clienteId);
 
       if (resultadoRecompensa.ok) {
@@ -857,10 +864,18 @@ io.on("connection", (socket) => {
       }
     }
 
+    const costoOriginal = data.costo;
+
     const pedido = {
       ...data,
       id: data.id || Date.now(),
       estado: "pendiente",
+      costo: recompensaPedido.usada
+        ? "GRATIS (recompensa 10 pedidos)"
+        : data.costo,
+      costoOriginal: recompensaPedido.usada
+        ? costoOriginal
+        : data.costoOriginal,
       promocion: crearPromocionVacia(),
       recompensa: recompensaPedido,
     };

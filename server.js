@@ -206,6 +206,32 @@ async function inicializarBaseDatos() {
       ON entregas_repartidor(repartidor_id);
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS repartidores_estado (
+        repartidor_id TEXT PRIMARY KEY,
+        repartidor_nombre TEXT NOT NULL,
+        disponible BOOLEAN NOT NULL DEFAULT TRUE,
+        fecha_actualizacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    for (const repartidor of REPARTIDORES) {
+      await pool.query(
+        `
+        INSERT INTO repartidores_estado (
+          repartidor_id,
+          repartidor_nombre,
+          disponible,
+          fecha_actualizacion
+        )
+        VALUES ($1, $2, TRUE, NOW())
+        ON CONFLICT (repartidor_id) DO UPDATE
+        SET repartidor_nombre = EXCLUDED.repartidor_nombre;
+        `,
+        [repartidor.id, repartidor.nombre]
+      );
+    }
+
     baseDatosLista = true;
     console.log("✅ Base de datos PostgreSQL lista para recompensas y clientes.");
   } catch (error) {
@@ -743,6 +769,206 @@ function obtenerRepartidorPorId(repartidorId) {
   );
 }
 
+// 🟢 Estado de servicio por repartidor
+const ESTADO_REPARTIDORES_FILE = path.join(__dirname, "estado_repartidores.json");
+
+function crearEstadoServicioInicial() {
+  return REPARTIDORES.reduce((estado, repartidor) => {
+    estado[repartidor.id] = {
+      repartidorId: repartidor.id,
+      repartidorNombre: repartidor.nombre,
+      disponible: true,
+      fechaActualizacion: new Date().toISOString(),
+    };
+    return estado;
+  }, {});
+}
+
+function cargarEstadoServicioLocal() {
+  try {
+    if (fs.existsSync(ESTADO_REPARTIDORES_FILE)) {
+      const guardado = JSON.parse(fs.readFileSync(ESTADO_REPARTIDORES_FILE, "utf8"));
+      return { ...crearEstadoServicioInicial(), ...guardado };
+    }
+  } catch (error) {
+    console.log("⚠️ No se pudo cargar estado de repartidores:", error.message);
+  }
+  return crearEstadoServicioInicial();
+}
+
+function guardarEstadoServicioLocal() {
+  try {
+    fs.writeFileSync(
+      ESTADO_REPARTIDORES_FILE,
+      JSON.stringify(estadoServicioRepartidores, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.log("⚠️ No se pudo guardar estado de repartidores:", error.message);
+  }
+}
+
+let estadoServicioRepartidores = cargarEstadoServicioLocal();
+
+function normalizarEstadoServicio(repartidoresEstado) {
+  const porId = new Map();
+  repartidoresEstado.forEach((item) => porId.set(String(item.repartidorId), item));
+
+  const repartidores = REPARTIDORES.map((repartidor) => {
+    const encontrado = porId.get(repartidor.id);
+
+    return {
+      repartidorId: repartidor.id,
+      repartidorNombre: repartidor.nombre,
+      disponible: encontrado?.disponible === undefined ? true : Boolean(encontrado.disponible),
+      fechaActualizacion: encontrado?.fechaActualizacion || null,
+    };
+  });
+
+  const activo = repartidores.some((item) => item.disponible);
+
+  return {
+    activo,
+    repartidores,
+    mensaje: activo
+      ? "Servicio disponible."
+      : "Por el momento estamos fuera de servicio. Intenta más tarde.",
+  };
+}
+
+async function obtenerEstadoServicio() {
+  if (!baseDatosLista || !pool) {
+    return normalizarEstadoServicio(Object.values(estadoServicioRepartidores));
+  }
+
+  try {
+    const resultado = await pool.query(`
+      SELECT repartidor_id, repartidor_nombre, disponible, fecha_actualizacion
+      FROM repartidores_estado
+      ORDER BY repartidor_nombre ASC;
+    `);
+
+    return normalizarEstadoServicio(
+      resultado.rows.map((row) => ({
+        repartidorId: row.repartidor_id,
+        repartidorNombre: row.repartidor_nombre,
+        disponible: row.disponible,
+        fechaActualizacion: row.fecha_actualizacion,
+      }))
+    );
+  } catch (error) {
+    console.log("⚠️ No se pudo consultar estado de servicio:", error.message);
+    return normalizarEstadoServicio(Object.values(estadoServicioRepartidores));
+  }
+}
+
+function obtenerTiempoPedido(pedido) {
+  const fechaPedido =
+    pedido?.fecha ||
+    pedido?.fechaCreacion ||
+    pedido?.createdAt ||
+    pedido?.fecha_creacion ||
+    null;
+
+  const tiempoPorFecha = fechaPedido ? new Date(fechaPedido).getTime() : NaN;
+
+  if (!Number.isNaN(tiempoPorFecha)) {
+    return tiempoPorFecha;
+  }
+
+  const tiempoPorId = Number(pedido?.id);
+
+  if (Number.isFinite(tiempoPorId)) {
+    return tiempoPorId;
+  }
+
+  return NaN;
+}
+
+async function obtenerEstadoRepartidorServicio(repartidorId) {
+  const estado = await obtenerEstadoServicio();
+
+  return estado.repartidores.find(
+    (item) => String(item.repartidorId) === String(repartidorId)
+  );
+}
+
+async function repartidorPuedeAceptarPedido(repartidorId, pedido) {
+  const estadoRepartidor = await obtenerEstadoRepartidorServicio(repartidorId);
+
+  if (!estadoRepartidor || estadoRepartidor.disponible !== false) {
+    return true;
+  }
+
+  const tiempoFueraServicio = new Date(
+    estadoRepartidor.fechaActualizacion
+  ).getTime();
+
+  const tiempoPedido = obtenerTiempoPedido(pedido);
+
+  if (Number.isNaN(tiempoFueraServicio) || Number.isNaN(tiempoPedido)) {
+    return false;
+  }
+
+  // Si el pedido cayó antes de que el repartidor se pusiera fuera de servicio,
+  // todavía puede aceptarlo para no dejar colgado al cliente.
+  return tiempoPedido <= tiempoFueraServicio;
+}
+
+async function actualizarEstadoServicioRepartidor(repartidorId, disponible) {
+  const repartidor = obtenerRepartidorPorId(repartidorId);
+
+  if (!repartidor) {
+    return { ok: false, mensaje: "Repartidor no válido." };
+  }
+
+  const disponibleFinal = Boolean(disponible);
+
+  if (!baseDatosLista || !pool) {
+    estadoServicioRepartidores[repartidor.id] = {
+      repartidorId: repartidor.id,
+      repartidorNombre: repartidor.nombre,
+      disponible: disponibleFinal,
+      fechaActualizacion: new Date().toISOString(),
+    };
+
+    guardarEstadoServicioLocal();
+
+    const estado = await obtenerEstadoServicio();
+    io.emit("servicio-actualizado", estado);
+
+    return { ok: true, estado };
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO repartidores_estado (
+        repartidor_id,
+        repartidor_nombre,
+        disponible,
+        fecha_actualizacion
+      )
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (repartidor_id) DO UPDATE
+      SET
+        repartidor_nombre = EXCLUDED.repartidor_nombre,
+        disponible = EXCLUDED.disponible,
+        fecha_actualizacion = NOW();
+      `,
+      [repartidor.id, repartidor.nombre, disponibleFinal]
+    );
+
+    const estado = await obtenerEstadoServicio();
+    io.emit("servicio-actualizado", estado);
+
+    return { ok: true, estado };
+  } catch (error) {
+    console.log("⚠️ No se pudo actualizar estado de servicio:", error.message);
+    return { ok: false, mensaje: "No se pudo actualizar el estado de servicio." };
+  }
+}
+
 function obtenerFechaHoraMexico() {
   return new Intl.DateTimeFormat("sv-SE", {
     timeZone: "America/Mexico_City",
@@ -1270,6 +1496,12 @@ function crearPromocionVacia() {
 io.on("connection", (socket) => {
   console.log("🟢 Usuario conectado:", socket.id);
 
+  obtenerEstadoServicio()
+    .then((estado) => socket.emit("servicio-actualizado", estado))
+    .catch((error) => {
+      console.log("⚠️ Error enviando estado de servicio:", error.message);
+    });
+
   const clienteId = socket.handshake.query.clienteId;
 
   // 👤 CLIENTES → room privado
@@ -1299,17 +1531,55 @@ io.on("connection", (socket) => {
     }
   });
 
+  // 🟢 Consultar estado general del servicio
+  socket.on("obtener-servicio", async (callback) => {
+    const estado = await obtenerEstadoServicio();
+    socket.emit("servicio-actualizado", estado);
+    if (typeof callback === "function") callback(estado);
+  });
+
+  // 🛵 Repartidor cambia disponible / fuera de servicio
+  socket.on("repartidor-servicio", async (data, callback) => {
+    const respuesta = await actualizarEstadoServicioRepartidor(
+      String(data?.repartidorId || "").trim(),
+      Boolean(data?.disponible)
+    );
+
+    if (typeof callback === "function") callback(respuesta);
+  });
+
   // 🛵 REPARTIDOR → room global + historial
   socket.on("repartidor-conectar", () => {
     socket.join("repartidores");
     console.log("🛵 Repartidor conectado");
+
+    obtenerEstadoServicio()
+      .then((estado) => socket.emit("servicio-actualizado", estado))
+      .catch((error) => {
+        console.log("⚠️ Error enviando servicio a repartidor:", error.message);
+      });
 
     // 🔥 HISTORIAL COMPLETO PARA REPARTIDOR
     socket.emit("pedidos-iniciales", pedidos);
   });
 
   // 📦 NUEVO PEDIDO
-  socket.on("nuevo-pedido", async (data) => {
+  socket.on("nuevo-pedido", async (data, callback) => {
+    const responderNuevoPedido = (respuesta) => {
+      if (typeof callback === "function") callback(respuesta);
+    };
+
+    const estadoServicio = await obtenerEstadoServicio();
+
+    if (!estadoServicio.activo) {
+      const mensaje = "Por el momento estamos fuera de servicio. Intenta más tarde.";
+
+      socket.emit("pedido-rechazado", { ok: false, mensaje });
+      responderNuevoPedido({ ok: false, mensaje });
+
+      return;
+    }
+
     let recompensaPedido = {
       usada: false,
       tipo: null,
@@ -1368,6 +1638,11 @@ io.on("connection", (socket) => {
     io.to("repartidores").emit("nuevo-pedido-repartidor", pedido);
 
     console.log("📦 Pedido creado:", pedido.id);
+
+    responderNuevoPedido({
+      ok: true,
+      pedido,
+    });
   });
 
   // 🔄 CAMBIAR ESTADO
@@ -1414,6 +1689,18 @@ io.on("connection", (socket) => {
     const pedidoEsDeOtroRepartidor =
       pedidoYaTieneRepartidor &&
       String(pedidoAnterior.repartidorId) !== String(repartidorActivo.id);
+
+    if (
+      estadoSolicitado === "aceptado" &&
+      !(await repartidorPuedeAceptarPedido(repartidorActivo.id, pedidoAnterior))
+    ) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoAnterior.id,
+        mensaje: "Estás fuera de servicio. Solo puedes aceptar pedidos que llegaron antes de que terminaras tu jornada.",
+      });
+      socket.emit("pedido-actualizado", pedidoAnterior);
+      return;
+    }
 
     if (estadoSolicitado === "aceptado" && pedidoEsDeOtroRepartidor) {
       socket.emit("error-repartidor", {

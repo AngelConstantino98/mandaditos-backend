@@ -1,0 +1,13 @@
+[
+  {
+    "pedidoId": "1783309770686",
+    "repartidorId": "angel",
+    "repartidorNombre": "Angel",
+    "clienteNombre": "angel",
+    "zona": "Tuxtla Chico",
+    "costo": "$20 - $60",
+    "comisionDueno": 10,
+    "fechaEntrega": "2026-07-06T03:49:56.209Z",
+    "fechaMexico": "2026-07-05 21:49:56"
+  }
+]

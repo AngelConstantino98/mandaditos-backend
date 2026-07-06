@@ -59,6 +59,35 @@ function guardarRecompensas() {
 
 let recompensas = cargarRecompensas();
 
+// 💰 Archivo simple de respaldo para entregas de repartidores
+const ENTREGAS_REPARTIDOR_FILE = path.join(__dirname, "entregas_repartidor.json");
+
+function cargarEntregasRepartidor() {
+  try {
+    if (fs.existsSync(ENTREGAS_REPARTIDOR_FILE)) {
+      return JSON.parse(fs.readFileSync(ENTREGAS_REPARTIDOR_FILE, "utf8"));
+    }
+  } catch (error) {
+    console.log("⚠️ No se pudieron cargar entregas de repartidores:", error.message);
+  }
+
+  return [];
+}
+
+function guardarEntregasRepartidor() {
+  try {
+    fs.writeFileSync(
+      ENTREGAS_REPARTIDOR_FILE,
+      JSON.stringify(entregasRepartidor, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.log("⚠️ No se pudieron guardar entregas de repartidores:", error.message);
+  }
+}
+
+let entregasRepartidor = cargarEntregasRepartidor();
+
 const DATABASE_URL = process.env.DATABASE_URL;
 let pool = null;
 let baseDatosLista = false;
@@ -152,6 +181,29 @@ async function inicializarBaseDatos() {
     await pool.query(`
       CREATE INDEX IF NOT EXISTS pedidos_fecha_actualizacion_idx
       ON pedidos(fecha_actualizacion DESC);
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS entregas_repartidor (
+        pedido_id TEXT PRIMARY KEY,
+        repartidor_id TEXT NOT NULL,
+        repartidor_nombre TEXT NOT NULL,
+        cliente_nombre TEXT,
+        zona TEXT,
+        costo TEXT,
+        comision_dueno INTEGER NOT NULL DEFAULT 10,
+        fecha_entrega TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS entregas_repartidor_fecha_idx
+      ON entregas_repartidor(fecha_entrega DESC);
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS entregas_repartidor_repartidor_idx
+      ON entregas_repartidor(repartidor_id);
     `);
 
     baseDatosLista = true;
@@ -484,6 +536,182 @@ async function obtenerTelefonoCliente(clienteId) {
     return "";
   }
 }
+
+// 🛵 Repartidores autorizados
+// Más adelante podemos moverlos a una tabla de PostgreSQL.
+// Por ahora quedan aquí para iniciar rápido y seguro.
+const REPARTIDORES = [
+  { id: "angel", nombre: "Angel", pin: "1003" },
+  { id: "eduardo", nombre: "Eduardo", pin: "0909" },
+  { id: "chalan", nombre: "Chalan", pin: "2026" },
+];
+
+function limpiarTextoAcceso(valor) {
+  return String(valor || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function obtenerRepartidorPorCredenciales(usuario, pin) {
+  const usuarioLimpio = limpiarTextoAcceso(usuario);
+  const pinLimpio = String(pin || "").trim();
+
+  return REPARTIDORES.find((repartidor) => {
+    return (
+      (limpiarTextoAcceso(repartidor.id) === usuarioLimpio ||
+        limpiarTextoAcceso(repartidor.nombre) === usuarioLimpio) &&
+      repartidor.pin === pinLimpio
+    );
+  });
+}
+
+function obtenerRepartidorPorId(repartidorId) {
+  const idLimpio = limpiarTextoAcceso(repartidorId);
+
+  return REPARTIDORES.find(
+    (repartidor) => limpiarTextoAcceso(repartidor.id) === idLimpio
+  );
+}
+
+function obtenerFechaHoraMexico() {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "America/Mexico_City",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date());
+}
+
+async function registrarEntregaRepartidorLocal(pedido) {
+  if (!pedido?.id || pedido.estado !== "entregado" || !pedido.repartidorId) {
+    return;
+  }
+
+  const pedidoId = String(pedido.id);
+
+  if (entregasRepartidor.some((entrega) => String(entrega.pedidoId) === pedidoId)) {
+    return;
+  }
+
+  const repartidor = obtenerRepartidorPorId(pedido.repartidorId);
+
+  if (!repartidor) {
+    console.log("⚠️ Repartidor no válido para registrar entrega:", pedido.repartidorId);
+    return;
+  }
+
+  const entrega = {
+    pedidoId,
+    repartidorId: repartidor.id,
+    repartidorNombre: repartidor.nombre,
+    clienteNombre: pedido.nombre || "",
+    zona: pedido.zona || "",
+    costo: String(pedido.costo || ""),
+    comisionDueno: 10,
+    fechaEntrega: new Date().toISOString(),
+    fechaMexico: obtenerFechaHoraMexico(),
+  };
+
+  entregasRepartidor = [entrega, ...entregasRepartidor].slice(0, 1000);
+  guardarEntregasRepartidor();
+
+  console.log("💰 Entrega registrada local:", entrega);
+}
+
+async function registrarEntregaRepartidor(pedido) {
+  if (!pedido?.id || pedido.estado !== "entregado" || !pedido.repartidorId) {
+    return;
+  }
+
+  const repartidor = obtenerRepartidorPorId(pedido.repartidorId);
+
+  if (!repartidor) {
+    console.log("⚠️ Repartidor no válido para registrar entrega:", pedido.repartidorId);
+    return;
+  }
+
+  if (!baseDatosLista || !pool) {
+    await registrarEntregaRepartidorLocal({
+      ...pedido,
+      repartidorId: repartidor.id,
+      repartidorNombre: repartidor.nombre,
+    });
+    return;
+  }
+
+  try {
+    const resultado = await pool.query(
+      `
+      INSERT INTO entregas_repartidor (
+        pedido_id,
+        repartidor_id,
+        repartidor_nombre,
+        cliente_nombre,
+        zona,
+        costo,
+        comision_dueno,
+        fecha_entrega
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 10, NOW())
+      ON CONFLICT (pedido_id) DO NOTHING
+      RETURNING pedido_id;
+      `,
+      [
+        String(pedido.id),
+        repartidor.id,
+        repartidor.nombre,
+        pedido.nombre || "",
+        pedido.zona || "",
+        String(pedido.costo || ""),
+      ]
+    );
+
+    if (resultado.rows.length > 0) {
+      console.log("💰 Entrega registrada:", {
+        pedidoId: pedido.id,
+        repartidor: repartidor.nombre,
+        comisionDueno: 10,
+        guardadoEn: "PostgreSQL",
+      });
+    }
+  } catch (error) {
+    console.log("⚠️ Error registrando entrega en DB:", error.message);
+    await registrarEntregaRepartidorLocal({
+      ...pedido,
+      repartidorId: repartidor.id,
+      repartidorNombre: repartidor.nombre,
+    });
+  }
+}
+
+// 🛵 Login de repartidor
+app.post("/repartidor/login", (req, res) => {
+  const usuario = String(req.body.usuario || req.body.nombre || "").trim();
+  const pin = String(req.body.pin || "").trim();
+
+  const repartidor = obtenerRepartidorPorCredenciales(usuario, pin);
+
+  if (!repartidor) {
+    return res.status(401).json({
+      ok: false,
+      mensaje: "Repartidor o PIN incorrecto.",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    mensaje: "Inicio de sesión correcto.",
+    repartidor: {
+      id: repartidor.id,
+      nombre: repartidor.nombre,
+    },
+  });
+});
 
 // 👤 Registrar cliente con teléfono + PIN
 app.post("/auth/registrar", async (req, res) => {
@@ -928,9 +1156,21 @@ io.on("connection", (socket) => {
       (p) => String(p.id) === String(pedidoActualizado.id)
     );
 
+    const repartidorActivo = obtenerRepartidorPorId(pedidoActualizado.repartidorId);
+
     const actualizado = {
       ...(pedidoAnterior || {}),
       ...pedidoActualizado,
+      repartidorId:
+        repartidorActivo?.id ||
+        pedidoActualizado.repartidorId ||
+        pedidoAnterior?.repartidorId ||
+        "",
+      repartidorNombre:
+        repartidorActivo?.nombre ||
+        pedidoActualizado.repartidorNombre ||
+        pedidoAnterior?.repartidorNombre ||
+        "",
     };
 
     const existePedido = pedidos.some(
@@ -959,6 +1199,9 @@ io.on("connection", (socket) => {
 
     // ⭐ Sumar recompensa cuando el pedido se marca como entregado
     await registrarPedidoEntregado(actualizado);
+
+    // 💰 Registrar comisión del dueño cuando el repartidor marca entregado
+    await registrarEntregaRepartidor(actualizado);
   });
 
   // ❌ CANCELAR

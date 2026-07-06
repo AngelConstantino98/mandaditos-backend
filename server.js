@@ -141,6 +141,9 @@ const HORARIOS_NEGOCIOS = {
     { dias: [1, 2, 3, 4, 5], abre: "08:00", cierra: "20:00" },
     { dias: [0, 6], abre: "08:00", cierra: "16:00" },
   ],
+  "el-carboncito": [
+    { dias: [0, 1, 2, 3, 4, 5, 6], abre: "16:00", cierra: "00:30" },
+  ],
 };
 
 function horaAMinutos(hora = "00:00") {

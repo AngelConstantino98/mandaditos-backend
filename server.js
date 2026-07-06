@@ -1376,21 +1376,90 @@ io.on("connection", (socket) => {
       (p) => String(p.id) === String(pedidoActualizado.id)
     );
 
+    if (!pedidoAnterior) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoActualizado.id,
+        mensaje: "Pedido no encontrado.",
+      });
+      return;
+    }
+
     const repartidorActivo = obtenerRepartidorPorId(pedidoActualizado.repartidorId);
+
+    if (!repartidorActivo) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoActualizado.id,
+        mensaje: "Inicia sesión como repartidor válido.",
+      });
+      socket.emit("pedido-actualizado", pedidoAnterior);
+      return;
+    }
+
+    const estadoAnterior = String(pedidoAnterior.estado || "").toLowerCase();
+    const estadoSolicitado = String(pedidoActualizado.estado || "").toLowerCase();
+
+    const pedidoFinalizado =
+      estadoAnterior === "cancelado" || estadoAnterior === "entregado";
+
+    if (pedidoFinalizado && estadoSolicitado !== estadoAnterior) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoAnterior.id,
+        mensaje: "Este pedido ya está finalizado.",
+      });
+      socket.emit("pedido-actualizado", pedidoAnterior);
+      return;
+    }
+
+    const pedidoYaTieneRepartidor = Boolean(pedidoAnterior.repartidorId);
+    const pedidoEsDeOtroRepartidor =
+      pedidoYaTieneRepartidor &&
+      String(pedidoAnterior.repartidorId) !== String(repartidorActivo.id);
+
+    if (estadoSolicitado === "aceptado" && pedidoEsDeOtroRepartidor) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoAnterior.id,
+        mensaje: `Este pedido ya fue aceptado por ${pedidoAnterior.repartidorNombre || "otro repartidor"}.`,
+      });
+      socket.emit("pedido-actualizado", pedidoAnterior);
+      return;
+    }
+
+    if (
+      ["en camino", "entregado"].includes(estadoSolicitado) &&
+      !pedidoYaTieneRepartidor
+    ) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoAnterior.id,
+        mensaje: "Primero debes aceptar el pedido.",
+      });
+      socket.emit("pedido-actualizado", pedidoAnterior);
+      return;
+    }
+
+    if (
+      ["en camino", "entregado"].includes(estadoSolicitado) &&
+      pedidoEsDeOtroRepartidor
+    ) {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoAnterior.id,
+        mensaje: `Solo ${pedidoAnterior.repartidorNombre || "el repartidor asignado"} puede actualizar este pedido.`,
+      });
+      socket.emit("pedido-actualizado", pedidoAnterior);
+      return;
+    }
+
+    const repartidorAsignadoId =
+      pedidoAnterior.repartidorId || repartidorActivo.id;
+
+    const repartidorAsignadoNombre =
+      pedidoAnterior.repartidorNombre || repartidorActivo.nombre;
 
     const actualizado = {
       ...(pedidoAnterior || {}),
       ...pedidoActualizado,
-      repartidorId:
-        repartidorActivo?.id ||
-        pedidoActualizado.repartidorId ||
-        pedidoAnterior?.repartidorId ||
-        "",
-      repartidorNombre:
-        repartidorActivo?.nombre ||
-        pedidoActualizado.repartidorNombre ||
-        pedidoAnterior?.repartidorNombre ||
-        "",
+      estado: pedidoActualizado.estado,
+      repartidorId: repartidorAsignadoId,
+      repartidorNombre: repartidorAsignadoNombre,
     };
 
     const existePedido = pedidos.some(
@@ -1538,7 +1607,38 @@ io.on("connection", (socket) => {
 
   // 🛵 GPS repartidor
   socket.on("repartidor-ubicacion", (data) => {
-    io.emit("repartidor-movimiento", data);
+    const repartidorActivo = obtenerRepartidorPorId(data?.repartidorId);
+
+    if (!repartidorActivo) {
+      return;
+    }
+
+    const gpsRepartidor = {
+      ...data,
+      repartidorId: repartidorActivo.id,
+      repartidorNombre: repartidorActivo.nombre,
+    };
+
+    const clientesConPedidoAsignado = [
+      ...new Set(
+        pedidos
+          .filter((p) => {
+            const estado = String(p.estado || "").toLowerCase();
+
+            return (
+              String(p.repartidorId || "") === String(repartidorActivo.id) &&
+              estado !== "cancelado" &&
+              estado !== "entregado" &&
+              p.clienteId
+            );
+          })
+          .map((p) => String(p.clienteId))
+      ),
+    ];
+
+    clientesConPedidoAsignado.forEach((idCliente) => {
+      io.to(idCliente).emit("repartidor-movimiento", gpsRepartidor);
+    });
   });
 
   socket.on("disconnect", () => {

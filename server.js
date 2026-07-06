@@ -461,6 +461,30 @@ function validarPin(pin) {
   return /^\d{4,6}$/.test(String(pin || ""));
 }
 
+// 📞 Obtener teléfono del cliente registrado usando su clienteId
+async function obtenerTelefonoCliente(clienteId) {
+  if (!clienteId || !baseDatosLista || !pool) {
+    return "";
+  }
+
+  try {
+    const resultado = await pool.query(
+      `
+      SELECT telefono
+      FROM clientes
+      WHERE cliente_id = $1
+      LIMIT 1;
+      `,
+      [clienteId]
+    );
+
+    return limpiarTelefono(resultado.rows[0]?.telefono || "");
+  } catch (error) {
+    console.log("⚠️ No se pudo obtener teléfono del cliente:", error.message);
+    return "";
+  }
+}
+
 // 👤 Registrar cliente con teléfono + PIN
 app.post("/auth/registrar", async (req, res) => {
   try {
@@ -865,6 +889,8 @@ io.on("connection", (socket) => {
       }
     }
 
+    const telefonoCliente = await obtenerTelefonoCliente(data.clienteId);
+
     const pedidoTextoConRecompensa = recompensaPedido.usada
       ? `${data.pedido}\n\n🎁 Cupón de recompensa: -$20 en el envío.`
       : data.pedido;
@@ -875,6 +901,7 @@ io.on("connection", (socket) => {
       pedido: pedidoTextoConRecompensa,
       estado: "pendiente",
       costo: data.costo,
+      telefonoCliente: telefonoCliente || data.telefonoCliente || "",
       promocion: crearPromocionVacia(),
       recompensa: recompensaPedido,
     };

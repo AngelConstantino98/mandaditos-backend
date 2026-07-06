@@ -1,5 +1,16 @@
 [
   {
+    "pedidoId": "1783347333326",
+    "repartidorId": "eduardo",
+    "repartidorNombre": "Eduardo",
+    "clienteNombre": "fgdg",
+    "zona": "Camino de la Tierra",
+    "costo": "$25 - $60",
+    "comisionDueno": 10,
+    "fechaEntrega": "2026-07-06T14:17:29.207Z",
+    "fechaMexico": "2026-07-06 08:17:29"
+  },
+  {
     "pedidoId": "1783309770686",
     "repartidorId": "angel",
     "repartidorNombre": "Angel",

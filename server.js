@@ -1558,10 +1558,20 @@ io.on("connection", (socket) => {
     }
 
     // No permitir pedidos cancelados
-    if (pedido.estado === "cancelado") {
+    if (String(pedido.estado || "").toLowerCase() === "cancelado") {
       responder({
         ok: false,
         mensaje: "Los pedidos cancelados no participan.",
+      });
+      return;
+    }
+
+    // Solo permitir participar cuando el pedido ya fue entregado.
+    // Esto evita que el cliente cancele e intente varias veces hasta ganar.
+    if (String(pedido.estado || "").toLowerCase() !== "entregado") {
+      responder({
+        ok: false,
+        mensaje: "Podrás probar tu suerte cuando el repartidor marque tu pedido como entregado. Si ganas, no se cobra el envío.",
       });
       return;
     }
@@ -1576,7 +1586,7 @@ io.on("connection", (socket) => {
 
     if (ganador) {
       promociones.ganadoresHoy++;
-      pedido.promocion.premio = "Pedido Gratis";
+      pedido.promocion.premio = "Envío Gratis";
     }
 
     await guardarPedidoEnDB(pedido);

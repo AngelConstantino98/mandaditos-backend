@@ -30,6 +30,11 @@ const io = new Server(server, {
 // 🧠 Memoria de pedidos
 let pedidos = [];
 
+// 🛰️ Última ubicación reciente de cada repartidor.
+// Solo se usa como respaldo para que el cliente vea ubicación al aceptar un pedido.
+const GPS_REPARTIDOR_RECIENTE_MS = 2 * 60 * 1000;
+let ultimasUbicacionesRepartidores = {};
+
 // ⭐ Archivo simple de respaldo para recompensas
 const RECOMPENSAS_FILE = path.join(__dirname, "recompensas.json");
 
@@ -902,6 +907,74 @@ function obtenerRepartidorPorId(repartidorId) {
   return REPARTIDORES.find(
     (repartidor) => limpiarTextoAcceso(repartidor.id) === idLimpio
   );
+}
+
+function guardarUltimaUbicacionRepartidor(data, repartidor) {
+  const lat = Number(data?.lat);
+  const lng = Number(data?.lng);
+
+  if (!repartidor?.id || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  const ubicacion = {
+    lat,
+    lng,
+    accuracy: Number.isFinite(Number(data?.accuracy))
+      ? Number(data.accuracy)
+      : null,
+    fecha: data?.fecha || new Date().toISOString(),
+    fechaServidor: new Date().toISOString(),
+    repartidorId: repartidor.id,
+    repartidorNombre: repartidor.nombre,
+  };
+
+  ultimasUbicacionesRepartidores[repartidor.id] = ubicacion;
+
+  return ubicacion;
+}
+
+function obtenerUltimaUbicacionReciente(repartidorId) {
+  const id = String(repartidorId || "").trim();
+  const ultima = ultimasUbicacionesRepartidores[id];
+
+  if (!ultima) {
+    return null;
+  }
+
+  const tiempo = new Date(ultima.fechaServidor || ultima.fecha).getTime();
+
+  if (Number.isNaN(tiempo)) {
+    return null;
+  }
+
+  if (Date.now() - tiempo > GPS_REPARTIDOR_RECIENTE_MS) {
+    return null;
+  }
+
+  return ultima;
+}
+
+function emitirUltimaUbicacionRepartidorACliente(pedido) {
+  if (!pedido?.clienteId || !pedido?.repartidorId) {
+    return false;
+  }
+
+  const estado = String(pedido.estado || "").toLowerCase();
+
+  if (estado === "cancelado" || estado === "entregado") {
+    return false;
+  }
+
+  const ultimaUbicacion = obtenerUltimaUbicacionReciente(pedido.repartidorId);
+
+  if (!ultimaUbicacion) {
+    return false;
+  }
+
+  io.to(String(pedido.clienteId)).emit("repartidor-movimiento", ultimaUbicacion);
+
+  return true;
 }
 
 // 🟢 Estado de servicio por repartidor
@@ -1903,10 +1976,18 @@ io.on("connection", (socket) => {
     socket.join(clienteId);
     console.log("👤 Cliente en room:", clienteId);
 
+    const pedidosDelCliente = pedidos.filter(
+      (p) => String(p.clienteId) === String(clienteId)
+    );
+
     socket.emit(
       "pedidos-iniciales",
-      pedidos.filter((p) => String(p.clienteId) === String(clienteId))
+      pedidosDelCliente
     );
+
+    pedidosDelCliente.forEach((pedidoCliente) => {
+      emitirUltimaUbicacionRepartidorACliente(pedidoCliente);
+    });
 
     // ⭐ Enviar estado de recompensas al cliente
     emitirRecompensaCliente(clienteId).catch((error) => {
@@ -2196,6 +2277,8 @@ io.on("connection", (socket) => {
       actualizado
     );
 
+    emitirUltimaUbicacionRepartidorACliente(actualizado);
+
     // ⭐ Sumar recompensa cuando el pedido se marca como entregado
     await registrarPedidoEntregado(actualizado);
 
@@ -2333,11 +2416,14 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const gpsRepartidor = {
-      ...data,
-      repartidorId: repartidorActivo.id,
-      repartidorNombre: repartidorActivo.nombre,
-    };
+    const gpsRepartidor = guardarUltimaUbicacionRepartidor(
+      data,
+      repartidorActivo
+    );
+
+    if (!gpsRepartidor) {
+      return;
+    }
 
     const clientesConPedidoAsignado = [
       ...new Set(

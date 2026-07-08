@@ -2286,6 +2286,87 @@ io.on("connection", (socket) => {
     await registrarEntregaRepartidor(actualizado);
   });
 
+  // 📍 MandaPlus fix GPS cliente v1:
+  // Permite que el cliente agregue GPS después de enviar el pedido.
+  // Importante: solo actualiza gps/ubicacionGPS; no cambia estado ni repartidor asignado.
+  socket.on("actualizar-gps-cliente", async (data, callback) => {
+    const responder = (respuesta) => {
+      if (typeof callback === "function") {
+        callback(respuesta);
+      }
+    };
+
+    const pedidoId = String(data?.pedidoId || "").trim();
+    const clientePedidoId = String(data?.clienteId || clienteId || "").trim();
+    const lat = Number(data?.gps?.lat ?? data?.ubicacionGPS?.lat);
+    const lng = Number(data?.gps?.lng ?? data?.ubicacionGPS?.lng);
+
+    if (!pedidoId || !clientePedidoId || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+      responder({
+        ok: false,
+        mensaje: "Datos de GPS inválidos.",
+      });
+      return;
+    }
+
+    const pedidoAnterior = pedidos.find(
+      (p) =>
+        String(p.id) === pedidoId &&
+        String(p.clienteId) === clientePedidoId
+    );
+
+    if (!pedidoAnterior) {
+      responder({
+        ok: false,
+        mensaje: "Pedido no encontrado para actualizar GPS.",
+      });
+      return;
+    }
+
+    const estadoPedido = String(pedidoAnterior.estado || "").toLowerCase();
+
+    if (estadoPedido === "cancelado" || estadoPedido === "entregado") {
+      responder({
+        ok: false,
+        mensaje: "Este pedido ya finalizó y no puede actualizar GPS.",
+      });
+      return;
+    }
+
+    const gpsCliente = {
+      lat,
+      lng,
+      fechaActualizacion: new Date().toISOString(),
+    };
+
+    const actualizado = {
+      ...pedidoAnterior,
+      gps: gpsCliente,
+      ubicacionGPS: gpsCliente,
+    };
+
+    pedidos = pedidos.map((p) =>
+      String(p.id) === pedidoId ? actualizado : p
+    );
+
+    await guardarPedidoEnDB(actualizado);
+
+    io.to(actualizado.clienteId).emit("pedido-actualizado", actualizado);
+    io.to("repartidores").emit("pedido-actualizado", actualizado);
+
+    responder({
+      ok: true,
+      pedido: actualizado,
+    });
+
+    console.log("📍 GPS del cliente actualizado:", {
+      pedidoId: actualizado.id,
+      clienteId: actualizado.clienteId,
+      estado: actualizado.estado,
+      repartidorId: actualizado.repartidorId || "",
+    });
+  });
+
   // ❌ CANCELAR
   socket.on("cancelar-pedido", async (data) => {
     pedidos = pedidos.map((p) =>

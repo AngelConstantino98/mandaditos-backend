@@ -1954,6 +1954,18 @@ function crearPromocionVacia() {
   };
 }
 
+function obtenerPedidosCliente(clientePedidoId) {
+  const id = String(clientePedidoId || "").trim();
+
+  if (!id) {
+    return [];
+  }
+
+  return pedidos
+    .filter((p) => String(p?.clienteId) === id)
+    .sort((a, b) => obtenerTiempoPedido(b) - obtenerTiempoPedido(a));
+}
+
 io.on("connection", (socket) => {
   console.log("🟢 Usuario conectado:", socket.id);
 
@@ -1976,9 +1988,7 @@ io.on("connection", (socket) => {
     socket.join(clienteId);
     console.log("👤 Cliente en room:", clienteId);
 
-    const pedidosDelCliente = pedidos.filter(
-      (p) => String(p.clienteId) === String(clienteId)
-    );
+    const pedidosDelCliente = obtenerPedidosCliente(clienteId);
 
     socket.emit(
       "pedidos-iniciales",
@@ -1994,6 +2004,42 @@ io.on("connection", (socket) => {
       console.log("⚠️ Error enviando recompensa:", error.message);
     });
   }
+
+
+
+  // 🔄 MandaPlus fix sincronización cliente v1:
+  // Si el cliente vuelve a abrir la app después de estar fuera,
+  // puede pedir el estado real de sus pedidos guardados en el servidor.
+  socket.on("obtener-pedidos-cliente", (data, callback) => {
+    const responder = (respuesta) => {
+      if (typeof callback === "function") {
+        callback(respuesta);
+      }
+    };
+
+    const clienteConsultaId = String(data?.clienteId || clienteId || "").trim();
+
+    if (!clienteConsultaId) {
+      responder({
+        ok: false,
+        mensaje: "Cliente no válido.",
+      });
+      return;
+    }
+
+    const pedidosDelCliente = obtenerPedidosCliente(clienteConsultaId);
+
+    socket.emit("pedidos-iniciales", pedidosDelCliente);
+
+    pedidosDelCliente.forEach((pedidoCliente) => {
+      emitirUltimaUbicacionRepartidorACliente(pedidoCliente);
+    });
+
+    responder({
+      ok: true,
+      pedidos: pedidosDelCliente,
+    });
+  });
 
   // ⭐ Cliente pide consultar sus recompensas
   socket.on("obtener-recompensa", async (callback) => {

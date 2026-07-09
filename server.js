@@ -710,6 +710,8 @@ const REPARTIDORES = [
   { id: "angel", nombre: "Angel", pin: "1003" },
   { id: "eduardo", nombre: "Eduardo", pin: "0909" },
   { id: "chalan", nombre: "Chalan", pin: "2026" },
+  { id: "cesar", nombre: "Cesar", pin: "2000" },
+  { id: "lex-cortez", nombre: "Lex Cortez", pin: "060396" },
 ];
 
 // 👑 Dueño autorizado para ver cuentas internas

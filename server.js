@@ -149,6 +149,9 @@ const HORARIOS_NEGOCIOS = {
   "el-carboncito": [
     { dias: [0, 1, 2, 3, 4, 5, 6], abre: "16:00", cierra: "00:30" },
   ],
+  "consgali": [
+    { dias: [0, 1, 2, 3, 4, 5, 6], abre: "18:00", cierra: "23:30" },
+  ],
 };
 
 function horaAMinutos(hora = "00:00") {
@@ -1968,6 +1971,89 @@ function obtenerPedidosCliente(clientePedidoId) {
     .sort((a, b) => obtenerTiempoPedido(b) - obtenerTiempoPedido(a));
 }
 
+const PEDIDO_DUPLICADO_MS = 5 * 60 * 1000;
+
+function normalizarTextoFirmaPedido(valor) {
+  return String(valor ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function crearFirmaPedidoCliente(pedido) {
+  const carritoSeguro = Array.isArray(pedido?.carritoNegocios)
+    ? pedido.carritoNegocios.map((item) => ({
+        id: item?.id || item?.productoId || "",
+        nombre: item?.nombre || "",
+        cantidad: item?.cantidad || 1,
+        precio: item?.precio ?? null,
+        negocioId: item?.negocioId || "",
+      }))
+    : [];
+
+  return [
+    "cliente",
+    pedido?.clienteId,
+    "nombre",
+    pedido?.nombre,
+    "pedido",
+    pedido?.pedido,
+    "ubicacion",
+    pedido?.ubicacion,
+    "zona",
+    pedido?.zona,
+    "costo",
+    pedido?.costo,
+    "negocios",
+    (pedido?.negociosIds || []).join(","),
+    "carrito",
+    JSON.stringify(carritoSeguro),
+  ]
+    .map(normalizarTextoFirmaPedido)
+    .join("|")
+    .slice(0, 3000);
+}
+
+function pedidoSigueActivoParaDuplicado(pedido) {
+  const estado = String(pedido?.estado || "").toLowerCase();
+  return estado !== "cancelado" && estado !== "entregado";
+}
+
+function buscarPedidoDuplicadoReciente(data) {
+  const clientePedidoClave = String(
+    data?.clientePedidoClave || data?.pedidoClienteClave || ""
+  ).trim();
+
+  const firmaPedido = clientePedidoClave || crearFirmaPedidoCliente(data);
+  const clienteIdPedido = String(data?.clienteId || "").trim();
+
+  if (!clienteIdPedido || !firmaPedido) {
+    return null;
+  }
+
+  return pedidos.find((pedido) => {
+    if (String(pedido?.clienteId || "") !== clienteIdPedido) {
+      return false;
+    }
+
+    if (!pedidoSigueActivoParaDuplicado(pedido)) {
+      return false;
+    }
+
+    const tiempoPedido = obtenerTiempoPedido(pedido);
+
+    if (Number.isNaN(tiempoPedido) || Date.now() - tiempoPedido > PEDIDO_DUPLICADO_MS) {
+      return false;
+    }
+
+    const firmaGuardada = String(
+      pedido?.clientePedidoClave || pedido?.pedidoClienteClave || pedido?.firmaPedidoCliente || ""
+    ).trim();
+
+    return firmaGuardada === firmaPedido || crearFirmaPedidoCliente(pedido) === firmaPedido;
+  });
+}
+
 io.on("connection", (socket) => {
   console.log("🟢 Usuario conectado:", socket.id);
 
@@ -2103,6 +2189,22 @@ io.on("connection", (socket) => {
       if (typeof callback === "function") callback(respuesta);
     };
 
+    const pedidoDuplicado = buscarPedidoDuplicadoReciente(data);
+
+    if (pedidoDuplicado) {
+      io.to(pedidoDuplicado.clienteId).emit("pedido-actualizado", pedidoDuplicado);
+      io.to("repartidores").emit("pedido-actualizado", pedidoDuplicado);
+
+      responderNuevoPedido({
+        ok: true,
+        duplicado: true,
+        mensaje: "Este pedido ya estaba registrado. No se creó otro igual.",
+        pedido: pedidoDuplicado,
+      });
+
+      return;
+    }
+
     const estadoServicio = await obtenerEstadoServicio();
 
     if (!estadoServicio.activo) {
@@ -2160,6 +2262,10 @@ io.on("connection", (socket) => {
     }
 
     const telefonoCliente = await obtenerTelefonoCliente(data.clienteId);
+    const clientePedidoClave = String(
+      data?.clientePedidoClave || data?.pedidoClienteClave || ""
+    ).trim();
+    const firmaPedidoCliente = clientePedidoClave || crearFirmaPedidoCliente(data);
 
     const pedidoTextoConRecompensa = recompensaPedido.usada
       ? `${data.pedido}\n\n🎁 Cupón de recompensa: -$20 en el envío.`
@@ -2172,6 +2278,8 @@ io.on("connection", (socket) => {
       estado: "pendiente",
       costo: data.costo,
       telefonoCliente: telefonoCliente || data.telefonoCliente || "",
+      clientePedidoClave: clientePedidoClave || firmaPedidoCliente,
+      firmaPedidoCliente,
       promocion: crearPromocionVacia(),
       recompensa: recompensaPedido,
     };
@@ -2198,27 +2306,43 @@ io.on("connection", (socket) => {
   });
 
   // 🔄 CAMBIAR ESTADO
-  socket.on("cambiar-estado", async (pedidoActualizado) => {
+  socket.on("cambiar-estado", async (pedidoActualizado, callback) => {
+    const responderCambioEstado = (respuesta) => {
+      if (typeof callback === "function") {
+        callback(respuesta);
+      }
+    };
+
+    const enviarErrorEstado = (pedidoBase, mensaje) => {
+      socket.emit("error-repartidor", {
+        pedidoId: pedidoActualizado?.id,
+        mensaje,
+      });
+
+      if (pedidoBase) {
+        socket.emit("pedido-actualizado", pedidoBase);
+      }
+
+      responderCambioEstado({
+        ok: false,
+        mensaje,
+        pedido: pedidoBase || null,
+      });
+    };
+
     const pedidoAnterior = pedidos.find(
       (p) => String(p.id) === String(pedidoActualizado.id)
     );
 
     if (!pedidoAnterior) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoActualizado.id,
-        mensaje: "Pedido no encontrado.",
-      });
+      enviarErrorEstado(null, "Pedido no encontrado.");
       return;
     }
 
     const repartidorActivo = obtenerRepartidorPorId(pedidoActualizado.repartidorId);
 
     if (!repartidorActivo) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoActualizado.id,
-        mensaje: "Inicia sesión como repartidor válido.",
-      });
-      socket.emit("pedido-actualizado", pedidoAnterior);
+      enviarErrorEstado(pedidoAnterior, "Inicia sesión como repartidor válido.");
       return;
     }
 
@@ -2229,11 +2353,7 @@ io.on("connection", (socket) => {
       estadoAnterior === "cancelado" || estadoAnterior === "entregado";
 
     if (pedidoFinalizado && estadoSolicitado !== estadoAnterior) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoAnterior.id,
-        mensaje: "Este pedido ya está finalizado.",
-      });
-      socket.emit("pedido-actualizado", pedidoAnterior);
+      enviarErrorEstado(pedidoAnterior, "Este pedido ya está finalizado.");
       return;
     }
 
@@ -2246,20 +2366,18 @@ io.on("connection", (socket) => {
       estadoSolicitado === "aceptado" &&
       !(await repartidorPuedeAceptarPedido(repartidorActivo.id, pedidoAnterior))
     ) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoAnterior.id,
-        mensaje: "Estás fuera de servicio. Solo puedes aceptar pedidos que llegaron antes de que terminaras tu jornada.",
-      });
-      socket.emit("pedido-actualizado", pedidoAnterior);
+      enviarErrorEstado(
+        pedidoAnterior,
+        "Estás fuera de servicio. Solo puedes aceptar pedidos que llegaron antes de que terminaras tu jornada."
+      );
       return;
     }
 
     if (estadoSolicitado === "aceptado" && pedidoEsDeOtroRepartidor) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoAnterior.id,
-        mensaje: `Este pedido ya fue aceptado por ${pedidoAnterior.repartidorNombre || "otro repartidor"}.`,
-      });
-      socket.emit("pedido-actualizado", pedidoAnterior);
+      enviarErrorEstado(
+        pedidoAnterior,
+        `Este pedido ya fue aceptado por ${pedidoAnterior.repartidorNombre || "otro repartidor"}.`
+      );
       return;
     }
 
@@ -2267,11 +2385,7 @@ io.on("connection", (socket) => {
       ["en camino", "entregado"].includes(estadoSolicitado) &&
       !pedidoYaTieneRepartidor
     ) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoAnterior.id,
-        mensaje: "Primero debes aceptar el pedido.",
-      });
-      socket.emit("pedido-actualizado", pedidoAnterior);
+      enviarErrorEstado(pedidoAnterior, "Primero debes aceptar el pedido.");
       return;
     }
 
@@ -2279,11 +2393,10 @@ io.on("connection", (socket) => {
       ["en camino", "entregado"].includes(estadoSolicitado) &&
       pedidoEsDeOtroRepartidor
     ) {
-      socket.emit("error-repartidor", {
-        pedidoId: pedidoAnterior.id,
-        mensaje: `Solo ${pedidoAnterior.repartidorNombre || "el repartidor asignado"} puede actualizar este pedido.`,
-      });
-      socket.emit("pedido-actualizado", pedidoAnterior);
+      enviarErrorEstado(
+        pedidoAnterior,
+        `Solo ${pedidoAnterior.repartidorNombre || "el repartidor asignado"} puede actualizar este pedido.`
+      );
       return;
     }
 
@@ -2299,6 +2412,7 @@ io.on("connection", (socket) => {
       estado: pedidoActualizado.estado,
       repartidorId: repartidorAsignadoId,
       repartidorNombre: repartidorAsignadoNombre,
+      fechaActualizacionEstado: new Date().toISOString(),
     };
 
     const existePedido = pedidos.some(
@@ -2332,6 +2446,11 @@ io.on("connection", (socket) => {
 
     // 💰 Registrar comisión del dueño cuando el repartidor marca entregado
     await registrarEntregaRepartidor(actualizado);
+
+    responderCambioEstado({
+      ok: true,
+      pedido: actualizado,
+    });
   });
 
   // 📍 MandaPlus fix GPS cliente v1:
@@ -2416,28 +2535,108 @@ io.on("connection", (socket) => {
   });
 
   // ❌ CANCELAR
-  socket.on("cancelar-pedido", async (data) => {
-    pedidos = pedidos.map((p) =>
-      String(p.id) === String(data.id) ? { ...p, estado: "cancelado" } : p
+  socket.on("cancelar-pedido", async (data, callback) => {
+    const responderCancelacion = (respuesta) => {
+      if (typeof callback === "function") {
+        callback(respuesta);
+      }
+    };
+
+    const pedidoId = String(data?.id || "").trim();
+
+    const pedidoAnterior = pedidos.find(
+      (p) => String(p.id) === pedidoId
     );
 
-    const actualizado = pedidos.find(
-      (p) => String(p.id) === String(data.id)
-    );
-
-    if (actualizado) {
-      await guardarPedidoEnDB(actualizado);
-
-      io.to(actualizado.clienteId).emit(
-        "pedido-actualizado",
-        actualizado
-      );
-
-      io.to("repartidores").emit(
-        "pedido-actualizado",
-        actualizado
-      );
+    if (!pedidoAnterior) {
+      responderCancelacion({
+        ok: false,
+        mensaje: "Pedido no encontrado.",
+      });
+      return;
     }
+
+    const estadoAnterior = String(pedidoAnterior.estado || "").toLowerCase();
+
+    if (estadoAnterior === "entregado") {
+      responderCancelacion({
+        ok: false,
+        mensaje: "Este pedido ya está entregado y no se puede cancelar.",
+        pedido: pedidoAnterior,
+      });
+      return;
+    }
+
+    if (estadoAnterior === "cancelado") {
+      responderCancelacion({
+        ok: true,
+        mensaje: "Este pedido ya estaba cancelado.",
+        pedido: pedidoAnterior,
+      });
+      return;
+    }
+
+    const repartidorId = String(data?.repartidorId || "").trim();
+    let repartidorCancelacion = null;
+
+    if (repartidorId) {
+      repartidorCancelacion = obtenerRepartidorPorId(repartidorId);
+
+      if (!repartidorCancelacion) {
+        responderCancelacion({
+          ok: false,
+          mensaje: "Repartidor no válido para cancelar.",
+          pedido: pedidoAnterior,
+        });
+        return;
+      }
+
+      if (
+        pedidoAnterior.repartidorId &&
+        String(pedidoAnterior.repartidorId) !== String(repartidorCancelacion.id)
+      ) {
+        responderCancelacion({
+          ok: false,
+          mensaje: `Solo ${pedidoAnterior.repartidorNombre || "el repartidor asignado"} puede cancelar este pedido.`,
+          pedido: pedidoAnterior,
+        });
+        return;
+      }
+    }
+
+    const actualizado = {
+      ...pedidoAnterior,
+      estado: "cancelado",
+      canceladoPor: repartidorCancelacion ? "repartidor" : "cliente",
+      canceladoPorId: repartidorCancelacion?.id || pedidoAnterior.clienteId || "",
+      canceladoPorNombre:
+        repartidorCancelacion?.nombre ||
+        data?.canceladoPorNombre ||
+        pedidoAnterior.nombre ||
+        "",
+      fechaCancelacion: new Date().toISOString(),
+    };
+
+    pedidos = pedidos.map((p) =>
+      String(p.id) === pedidoId ? actualizado : p
+    );
+
+    await guardarPedidoEnDB(actualizado);
+
+    io.to(actualizado.clienteId).emit(
+      "pedido-actualizado",
+      actualizado
+    );
+
+    io.to("repartidores").emit(
+      "pedido-actualizado",
+      actualizado
+    );
+
+    responderCancelacion({
+      ok: true,
+      pedido: actualizado,
+    });
   });
 
   // 🍀 PROBAR SUERTE

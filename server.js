@@ -30,6 +30,12 @@ const io = new Server(server, {
 // 🧠 Memoria de pedidos
 let pedidos = [];
 
+// 🔒 Sesiones privadas de repartidores y respaldo local de promociones manuales.
+// Las promociones manuales nunca se envían dentro del pedido ni se muestran a otros usuarios.
+const sesionesRepartidores = new Map();
+const promocionesManualesLocal = new Map();
+const DURACION_SESION_REPARTIDOR_MS = 30 * 24 * 60 * 60 * 1000;
+
 // 🛰️ Última ubicación reciente de cada repartidor.
 // Solo se usa como respaldo para que el cliente vea ubicación al aceptar un pedido.
 const GPS_REPARTIDOR_RECIENTE_MS = 2 * 60 * 1000;
@@ -300,6 +306,20 @@ async function inicializarBaseDatos() {
         fecha_creacion TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         fecha_actualizacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS promociones_manuales (
+        pedido_id TEXT PRIMARY KEY,
+        resultado TEXT NOT NULL DEFAULT 'ganador',
+        repartidor_id TEXT NOT NULL,
+        fecha_actualizacion TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS promociones_manuales_fecha_idx
+      ON promociones_manuales(fecha_actualizacion DESC);
     `);
 
     await pool.query(`
@@ -912,6 +932,148 @@ function obtenerRepartidorPorId(repartidorId) {
   return REPARTIDORES.find(
     (repartidor) => limpiarTextoAcceso(repartidor.id) === idLimpio
   );
+}
+
+function crearSesionRepartidor(repartidor) {
+  const tokenAcceso = crypto.randomBytes(32).toString("hex");
+
+  sesionesRepartidores.set(tokenAcceso, {
+    repartidorId: repartidor.id,
+    fechaExpiracion: Date.now() + DURACION_SESION_REPARTIDOR_MS,
+  });
+
+  return tokenAcceso;
+}
+
+function validarSesionRepartidor(repartidorId, tokenAcceso) {
+  const token = String(tokenAcceso || "").trim();
+  const sesion = sesionesRepartidores.get(token);
+
+  if (!token || !sesion) return false;
+
+  if (Date.now() > Number(sesion.fechaExpiracion || 0)) {
+    sesionesRepartidores.delete(token);
+    return false;
+  }
+
+  return limpiarTextoAcceso(sesion.repartidorId) === limpiarTextoAcceso(repartidorId);
+}
+
+function puedeGestionarPromociones(repartidorId, tokenAcceso) {
+  return (
+    limpiarTextoAcceso(repartidorId) === "angel" &&
+    validarSesionRepartidor(repartidorId, tokenAcceso)
+  );
+}
+
+async function guardarPromocionManual(pedidoId, repartidorId) {
+  const id = String(pedidoId || "").trim();
+
+  if (!id) return false;
+
+  if (!baseDatosLista || !pool) {
+    promocionesManualesLocal.set(id, {
+      pedidoId: id,
+      resultado: "ganador",
+      repartidorId,
+      fechaActualizacion: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO promociones_manuales (
+        pedido_id,
+        resultado,
+        repartidor_id,
+        fecha_actualizacion
+      )
+      VALUES ($1, 'ganador', $2, NOW())
+      ON CONFLICT (pedido_id) DO UPDATE
+      SET
+        resultado = 'ganador',
+        repartidor_id = EXCLUDED.repartidor_id,
+        fecha_actualizacion = NOW();
+      `,
+      [id, repartidorId]
+    );
+    return true;
+  } catch (error) {
+    console.log("⚠️ No se pudo guardar promoción privada:", error.message);
+    return false;
+  }
+}
+
+async function eliminarPromocionManual(pedidoId) {
+  const id = String(pedidoId || "").trim();
+
+  if (!id) return false;
+
+  promocionesManualesLocal.delete(id);
+
+  if (!baseDatosLista || !pool) {
+    return true;
+  }
+
+  try {
+    await pool.query(
+      `DELETE FROM promociones_manuales WHERE pedido_id = $1;`,
+      [id]
+    );
+    return true;
+  } catch (error) {
+    console.log("⚠️ No se pudo quitar promoción privada:", error.message);
+    return false;
+  }
+}
+
+async function obtenerPromocionManual(pedidoId) {
+  const id = String(pedidoId || "").trim();
+
+  if (!id) return null;
+
+  if (!baseDatosLista || !pool) {
+    return promocionesManualesLocal.get(id) || null;
+  }
+
+  try {
+    const resultado = await pool.query(
+      `
+      SELECT pedido_id, resultado, repartidor_id, fecha_actualizacion
+      FROM promociones_manuales
+      WHERE pedido_id = $1
+      LIMIT 1;
+      `,
+      [id]
+    );
+
+    return resultado.rows[0] || null;
+  } catch (error) {
+    console.log("⚠️ No se pudo consultar promoción privada:", error.message);
+    return promocionesManualesLocal.get(id) || null;
+  }
+}
+
+async function listarPromocionesManuales() {
+  if (!baseDatosLista || !pool) {
+    return [...promocionesManualesLocal.keys()];
+  }
+
+  try {
+    const resultado = await pool.query(`
+      SELECT pedido_id
+      FROM promociones_manuales
+      WHERE resultado = 'ganador'
+      ORDER BY fecha_actualizacion DESC;
+    `);
+
+    return resultado.rows.map((row) => String(row.pedido_id));
+  } catch (error) {
+    console.log("⚠️ No se pudieron listar promociones privadas:", error.message);
+    return [...promocionesManualesLocal.keys()];
+  }
 }
 
 function guardarUltimaUbicacionRepartidor(data, repartidor) {
@@ -1615,12 +1777,18 @@ app.post("/repartidor/login", (req, res) => {
     });
   }
 
+  const tokenAcceso = crearSesionRepartidor(repartidor);
+
   return res.json({
     ok: true,
     mensaje: "Inicio de sesión correcto.",
     repartidor: {
       id: repartidor.id,
       nombre: repartidor.nombre,
+      tokenAcceso,
+      ...(repartidor.id === "angel"
+        ? { puedeGestionarPromociones: true }
+        : {}),
     },
   });
 });
@@ -1836,7 +2004,7 @@ async function guardarPedidoEnDB(pedido) {
         pedido.clienteId,
         pedido.estado || "pendiente",
         JSON.stringify(pedido),
-        pedido.fecha || null
+        pedido.fechaRecibido || pedido.fecha || null
       ]
     );
         console.log("💾 Pedido guardado en PostgreSQL:", pedido.id);
@@ -1873,11 +2041,7 @@ async function cargarPedidosDesdeDB() {
 const promociones = {
   fecha: null,
   ganadoresHoy: 0,
-
-  // Configuración
-  maxGanadoresAltaProbabilidad: 2,
-  probabilidadAlta: 35, // %
-  probabilidadBaja: 10, // %
+  probabilidad: 10, // Todos los pedidos tienen exactamente 10 %.
 };
 
 // 🕒 Fecha local de México para reinicio diario
@@ -1902,18 +2066,10 @@ function verificarReinicioPromociones() {
   }
 }
 
-// 🎲 Obtiene la probabilidad actual
+// 🎲 Todos los pedidos usan la misma probabilidad.
 function obtenerProbabilidadActual() {
   verificarReinicioPromociones();
-
-  if (
-    promociones.ganadoresHoy <
-    promociones.maxGanadoresAltaProbabilidad
-  ) {
-    return promociones.probabilidadAlta;
-  }
-
-  return promociones.probabilidadBaja;
+  return promociones.probabilidad;
 }
 
 // 🕒 Convierte una fecha ISO al día de México
@@ -2183,6 +2339,101 @@ io.on("connection", (socket) => {
     socket.emit("pedidos-iniciales", pedidos);
   });
 
+  // 🔒 Consulta privada del control de promociones. Solo la sesión de Angel puede usarla.
+  socket.on("obtener-promociones-manuales", async (data, callback) => {
+    const repartidorId = String(data?.repartidorId || "").trim();
+    const tokenAcceso = String(data?.tokenAcceso || "").trim();
+
+    if (!puedeGestionarPromociones(repartidorId, tokenAcceso)) {
+      if (typeof callback === "function") {
+        callback({
+          ok: false,
+          mensaje: "Sesión privada no autorizada o expirada.",
+        });
+      }
+      return;
+    }
+
+    const pedidosIds = await listarPromocionesManuales();
+
+    if (typeof callback === "function") {
+      callback({ ok: true, pedidosIds });
+    }
+  });
+
+  // 🔒 Permite asegurar o retirar un premio sin revelar el control a otros usuarios.
+  socket.on("gestionar-promocion-manual", async (data, callback) => {
+    const responder = (respuesta) => {
+      if (typeof callback === "function") callback(respuesta);
+    };
+
+    const repartidorId = String(data?.repartidorId || "").trim();
+    const tokenAcceso = String(data?.tokenAcceso || "").trim();
+    const pedidoId = String(data?.pedidoId || "").trim();
+    const accion = String(data?.accion || "").trim().toLowerCase();
+
+    if (!puedeGestionarPromociones(repartidorId, tokenAcceso)) {
+      responder({
+        ok: false,
+        mensaje: "Tu sesión privada expiró. Cierra sesión e inicia nuevamente.",
+      });
+      return;
+    }
+
+    const pedido = pedidos.find((item) => String(item.id) === pedidoId);
+
+    if (!pedido) {
+      responder({ ok: false, mensaje: "Pedido no encontrado." });
+      return;
+    }
+
+    if (pedido.promocion?.participo) {
+      responder({
+        ok: false,
+        mensaje: "Este pedido ya utilizó el botón Probar mi suerte.",
+      });
+      return;
+    }
+
+    if (String(pedido.estado || "").toLowerCase() === "cancelado") {
+      responder({
+        ok: false,
+        mensaje: "No se puede configurar un pedido cancelado.",
+      });
+      return;
+    }
+
+    if (accion === "regalar") {
+      const guardado = await guardarPromocionManual(pedidoId, repartidorId);
+
+      responder({
+        ok: guardado,
+        pedidoId,
+        seleccionado: guardado,
+        mensaje: guardado
+          ? "Resultado privado guardado."
+          : "No se pudo guardar el resultado privado.",
+      });
+      return;
+    }
+
+    if (accion === "quitar") {
+      const eliminado = await eliminarPromocionManual(pedidoId);
+
+      responder({
+        ok: eliminado,
+        pedidoId,
+        seleccionado: false,
+        mensaje: eliminado
+          ? "El pedido vuelve a participar con 10 %."
+          : "No se pudo quitar el resultado privado.",
+      });
+      return;
+    }
+
+    responder({ ok: false, mensaje: "Acción no válida." });
+  });
+
   // 📦 NUEVO PEDIDO
   socket.on("nuevo-pedido", async (data, callback) => {
     const responderNuevoPedido = (respuesta) => {
@@ -2271,6 +2522,8 @@ io.on("connection", (socket) => {
       ? `${data.pedido}\n\n🎁 Cupón de recompensa: -$20 en el envío.`
       : data.pedido;
 
+    const fechaRecibido = new Date().toISOString();
+
     const pedido = {
       ...data,
       id: data.id || Date.now(),
@@ -2280,6 +2533,9 @@ io.on("connection", (socket) => {
       telefonoCliente: telefonoCliente || data.telefonoCliente || "",
       clientePedidoClave: clientePedidoClave || firmaPedidoCliente,
       firmaPedidoCliente,
+      fecha: data.fecha || fechaRecibido,
+      fechaRecibido,
+      fechaEntregado: null,
       promocion: crearPromocionVacia(),
       recompensa: recompensaPedido,
     };
@@ -2406,13 +2662,26 @@ io.on("connection", (socket) => {
     const repartidorAsignadoNombre =
       pedidoAnterior.repartidorNombre || repartidorActivo.nombre;
 
+    const fechaCambioEstado = new Date().toISOString();
+
     const actualizado = {
       ...(pedidoAnterior || {}),
       ...pedidoActualizado,
       estado: pedidoActualizado.estado,
       repartidorId: repartidorAsignadoId,
       repartidorNombre: repartidorAsignadoNombre,
-      fechaActualizacionEstado: new Date().toISOString(),
+      fechaRecibido:
+        pedidoAnterior.fechaRecibido ||
+        pedidoAnterior.fecha ||
+        pedidoAnterior.fechaCreacion ||
+        fechaCambioEstado,
+      fechaEntregado:
+        estadoSolicitado === "entregado"
+          ? pedidoAnterior.fechaEntregado || fechaCambioEstado
+          : pedidoAnterior.fechaEntregado || null,
+      fechaActualizacionEstado: fechaCambioEstado,
+      promocion: pedidoAnterior.promocion || crearPromocionVacia(),
+      recompensa: pedidoAnterior.recompensa || { usada: false, tipo: null },
     };
 
     const existePedido = pedidos.some(
@@ -2622,6 +2891,7 @@ io.on("connection", (socket) => {
     );
 
     await guardarPedidoEnDB(actualizado);
+    await eliminarPromocionManual(actualizado.id);
 
     io.to(actualizado.clienteId).emit(
       "pedido-actualizado",
@@ -2698,8 +2968,10 @@ io.on("connection", (socket) => {
     }
 
     const probabilidad = obtenerProbabilidadActual();
+    const promocionManual = await obtenerPromocionManual(pedido.id);
     const numero = Math.random() * 100;
-    const ganador = numero < probabilidad;
+    const ganador =
+      promocionManual?.resultado === "ganador" || numero < probabilidad;
 
     pedido.promocion.participo = true;
     pedido.promocion.ganador = ganador;
@@ -2711,6 +2983,7 @@ io.on("connection", (socket) => {
     }
 
     await guardarPedidoEnDB(pedido);
+    await eliminarPromocionManual(pedido.id);
 
     // Avisar al cliente
     io.to(pedido.clienteId).emit("pedido-actualizado", pedido);

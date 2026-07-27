@@ -1763,6 +1763,88 @@ app.post("/dueno/resumen-entregas", async (req, res) => {
   }
 });
 
+// 🔐 Restablecer NIP de cliente desde el Panel Dueño.
+// Solo cambia pin_hash; conserva cliente_id, pedidos, puntos, cupones y recompensas.
+app.post("/dueno/restablecer-pin-cliente", async (req, res) => {
+  try {
+    if (!baseDatosLista || !pool) {
+      return res.status(500).json({
+        ok: false,
+        mensaje: "Base de datos no disponible.",
+      });
+    }
+
+    const usuario = String(req.body.usuario || "").trim();
+    const pinDueno = String(req.body.pin || "").trim();
+    const telefono = limpiarTelefono(req.body.telefono);
+    const nuevoPin = String(req.body.nuevoPin || "").trim();
+
+    if (!validarCredencialesDueno(usuario, pinDueno)) {
+      return res.status(401).json({
+        ok: false,
+        mensaje: "No autorizado.",
+      });
+    }
+
+    if (telefono.length < 10) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "Escribe un número de teléfono válido.",
+      });
+    }
+
+    if (!validarPin(nuevoPin)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "El NIP nuevo debe tener de 4 a 6 números.",
+      });
+    }
+
+    const pinHash = await bcrypt.hash(nuevoPin, 10);
+
+    const resultado = await pool.query(
+      `
+      UPDATE clientes
+      SET pin_hash = $1
+      WHERE telefono = $2
+      RETURNING cliente_id, telefono, nombre;
+      `,
+      [pinHash, telefono]
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        mensaje: "No existe un cliente registrado con ese teléfono.",
+      });
+    }
+
+    const cliente = resultado.rows[0];
+
+    console.log("🔐 NIP de cliente restablecido por el dueño:", {
+      clienteId: cliente.cliente_id,
+      telefono: cliente.telefono,
+    });
+
+    return res.json({
+      ok: true,
+      mensaje: "NIP restablecido correctamente.",
+      cliente: {
+        clienteId: cliente.cliente_id,
+        telefono: cliente.telefono,
+        nombre: cliente.nombre,
+      },
+    });
+  } catch (error) {
+    console.log("⚠️ Error restableciendo NIP del cliente:", error.message);
+
+    return res.status(500).json({
+      ok: false,
+      mensaje: "No se pudo restablecer el NIP del cliente.",
+    });
+  }
+});
+
 // 🛵 Login de repartidor
 app.post("/repartidor/login", (req, res) => {
   const usuario = String(req.body.usuario || req.body.nombre || "").trim();
